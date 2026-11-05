@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+.env
+
+# Local model cache (Stage 5) and downloaded weights
+.model-cache/
+*.pt
+*.safetensors
+*.joblib

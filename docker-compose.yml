@@ -1,0 +1,58 @@
+# Backing services for local development.
+# Stage 0 runs only the infrastructure; the API and worker run on the host
+# with `uv run`. Later stages add the api/worker containers, Prometheus,
+# Grafana and Locust to this file.
+
+name: modeldock
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    # appendonly off: queues, reply lists and cache are all ephemeral by design
+    # (see D12: in-flight requests are not recovered). No disk persistence needed.
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: modeldock
+      POSTGRES_PASSWORD: modeldock
+      POSTGRES_DB: modeldock
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U modeldock -d modeldock"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  minio:
+    # The official minio/minio image stopped being published in Oct 2025.
+    # Chainguard's free build is the same MinIO server, built from source.
+    # It is a minimal image with no shell or curl, so there is no in-container
+    # healthcheck; check it from the host instead (see docs/stages/00-skeleton.md).
+    image: cgr.dev/chainguard/minio:latest
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+    volumes:
+      - miniodata:/data
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  miniodata:
