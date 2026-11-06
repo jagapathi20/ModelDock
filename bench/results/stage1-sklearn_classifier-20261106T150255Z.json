@@ -1,0 +1,122 @@
+{
+  "args": {
+    "kind": "sklearn_classifier",
+    "model_dir": "artifacts/iris-v1",
+    "batch_sizes": "1,2,4,8,16,32",
+    "threads": 8,
+    "words": 24,
+    "warmup": 5,
+    "iters": 100,
+    "max_batch_size": 16,
+    "max_wait_ms": 15.0,
+    "target_ms": 150.0,
+    "out": null
+  },
+  "machine": {
+    "platform": "macOS-26.1-arm64-arm-64bit",
+    "python": "3.12.11",
+    "cpu_count_logical": 8,
+    "cpu_model": "arm",
+    "inference_threads": null,
+    "torch": "2.15.0",
+    "transformers": "5.22.1",
+    "torch_num_threads": 4
+  },
+  "load_seconds": 0.7258453329995973,
+  "results": [
+    {
+      "batch_size": 1,
+      "iters": 100,
+      "batch_ms_p50": 0.120667,
+      "batch_ms_p90": 0.17325,
+      "batch_ms_p99": 0.283125,
+      "batch_ms_mean": 0.1327992,
+      "item_ms_p50": 0.120667,
+      "items_per_sec": 8287.269924668717,
+      "speedup_per_item_vs_bs1": 1.0,
+      "phases_ms_p50": {},
+      "padded_tokens_mean": null
+    },
+    {
+      "batch_size": 2,
+      "iters": 100,
+      "batch_ms_p50": 0.115708,
+      "batch_ms_p90": 0.122875,
+      "batch_ms_p99": 0.145875,
+      "batch_ms_mean": 0.11943081,
+      "item_ms_p50": 0.057854,
+      "items_per_sec": 17284.889549555777,
+      "speedup_per_item_vs_bs1": 2.085715767276247,
+      "phases_ms_p50": {},
+      "padded_tokens_mean": null
+    },
+    {
+      "batch_size": 4,
+      "iters": 100,
+      "batch_ms_p50": 0.118125,
+      "batch_ms_p90": 0.122208,
+      "batch_ms_p99": 0.135084,
+      "batch_ms_mean": 0.11919459,
+      "item_ms_p50": 0.02953125,
+      "items_per_sec": 33862.43386243386,
+      "speedup_per_item_vs_bs1": 4.086078306878307,
+      "phases_ms_p50": {},
+      "padded_tokens_mean": null
+    },
+    {
+      "batch_size": 8,
+      "iters": 100,
+      "batch_ms_p50": 0.1191045,
+      "batch_ms_p90": 0.122375,
+      "batch_ms_p99": 0.136291,
+      "batch_ms_mean": 0.11958624000000001,
+      "item_ms_p50": 0.0148880625,
+      "items_per_sec": 67167.90717395229,
+      "speedup_per_item_vs_bs1": 8.1049498549593,
+      "phases_ms_p50": {},
+      "padded_tokens_mean": null
+    },
+    {
+      "batch_size": 16,
+      "iters": 100,
+      "batch_ms_p50": 0.124625,
+      "batch_ms_p90": 0.12825,
+      "batch_ms_p99": 0.148875,
+      "batch_ms_mean": 0.12533497999999998,
+      "item_ms_p50": 0.0077890625,
+      "items_per_sec": 128385.15546639918,
+      "speedup_per_item_vs_bs1": 15.491851554663992,
+      "phases_ms_p50": {},
+      "padded_tokens_mean": null
+    },
+    {
+      "batch_size": 32,
+      "iters": 100,
+      "batch_ms_p50": 0.1295,
+      "batch_ms_p90": 0.132958,
+      "batch_ms_p99": 0.140125,
+      "batch_ms_mean": 0.13018662,
+      "item_ms_p50": 0.004046875,
+      "items_per_sec": 247104.2471042471,
+      "speedup_per_item_vs_bs1": 29.817328185328183,
+      "phases_ms_p50": {},
+      "padded_tokens_mean": null
+    }
+  ],
+  "latency_budget": {
+    "max_batch_size": 16,
+    "max_wait_ms": 15.0,
+    "full_batch_ms_p99": 0.148875,
+    "target_p99_ms": 150.0,
+    "worst_case_ms": {
+      "light_load": 15.148875,
+      "saturated": 0.29775,
+      "at_backpressure_threshold": 0.44662500000000005
+    },
+    "within_target": {
+      "light_load": true,
+      "saturated": true,
+      "at_backpressure_threshold": true
+    }
+  }
+}
