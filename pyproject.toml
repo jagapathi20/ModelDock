@@ -14,6 +14,29 @@ dependencies = [
     "pydantic-settings>=2.3",
 ]
 
+[project.optional-dependencies]
+# Worker-only dependencies, installed with `uv sync --extra worker`.
+# API processes never load models (D3), so their install (and later their
+# Docker image) leaves out PyTorch and friends entirely: several hundred MB.
+worker = [
+    "torch>=2.15",
+    "transformers>=5.0",
+    "scikit-learn>=1.9",
+    "joblib>=1.6",
+    "numpy>=2.0",
+]
+
+# On Linux, PyPI's torch wheel is the CUDA build and pulls in ~3 GB of NVIDIA
+# libraries we'd never use. Point Linux at PyTorch's CPU-only wheel index.
+# macOS and Windows wheels on PyPI are already CPU-only, so they use PyPI.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true  # only packages listed in [tool.uv.sources] come from here
+
 [dependency-groups]
 dev = [
     "pytest>=8.2",
@@ -30,6 +53,8 @@ build-backend = "hatchling.build"
 # Three top-level packages instead of one src/ package: the API and the worker
 # are separate deployables that share only `common`.
 packages = ["api", "worker", "common"]
+# scripts/ is deliberately not packaged: developer tools, run from the repo
+# root with `uv run python -m scripts.<name>`.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

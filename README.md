@@ -15,6 +15,21 @@ uv run uvicorn api.main:app --reload
 curl localhost:8000/health/live
 ```
 
+## Models and batching benchmark
+
+```bash
+uv sync --extra worker                          # torch (CPU), transformers, scikit-learn
+uv run python -m scripts.fetch_sentiment_model  # -> artifacts/sentiment-v1
+uv run python -m scripts.train_iris             # -> artifacts/iris-v1
+uv run python -m scripts.bench_batching --model-dir artifacts/sentiment-v1
+```
+
+## Benchmark results
+
+- [Stage 1: batching and CPU threads](docs/benchmarks/stage-1-batching.md): on an Apple M1,
+  batching 16 requests makes each 4.2× cheaper, and limiting PyTorch to the 4 performance
+  cores cuts p99 batch time at batch size 16 from 107.8 ms to 54.6 ms.
+
 ## Checks
 
 ```bash
