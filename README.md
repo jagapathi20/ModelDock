@@ -6,6 +6,9 @@ canary rollouts, rate limiting and stage-level observability, measured under loa
 
 Work in progress. The build is staged; each stage is explained in `docs/stages/`.
 
+**Design:** [`docs/DESIGN.md`](docs/DESIGN.md) holds the initial design and a log of every change
+made to it during the build, with the reason and evidence for each.
+
 ## Run locally
 
 ```bash
