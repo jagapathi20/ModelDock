@@ -15,8 +15,14 @@ each run, including hardware and library versions, is committed as JSON in `benc
 | On Apple M1, using all 8 cores is **slower** than using only the 4 performance cores, and it makes worst-case (p99) batch times **about 2× worse**. | Runs B vs C, table 2 |
 | With 4 threads, a batch of 16 takes 51.8 ms typically and 54.6 ms at p99, so its timing is tight and predictable. | Run B |
 | The neural network itself (forward pass) is **98%** of batch time. Tokenization is under 2%. | Run B, table 3 |
-| At batch size 16, the worst case at the backpressure threshold (~164 ms) **misses the 150 ms target**, even before network overhead. Batch size 8 fits (~100 ms). | Table 4 |
+| At batch size 16, a saturated worker's worst case is ~164 ms, which **misses the 150 ms target** even with an empty queue. Batch size 8 gives ~100 ms. **Decision: batch size 8.** | Table 4 |
+| The queue limit (503 threshold) is derived from the latency budget and set **per model version**: 8 requests per worker for the transformer, hundreds for sklearn. | Queue limit section |
 | The sklearn model costs a flat **0.12 ms** per call whatever the batch size, so all of it is fixed per-call cost. | Run S |
+| **Follow-up (2026-11-10):** batch time tracks total padded tokens, not request count, so batching helps less as inputs get longer: 10.6× per item at batch 32 for 10-token inputs, 1.8× at 128 tokens. | Runs D–H, table 5 |
+| **Follow-up:** with the worker pulling a batch only when compute is free (no collector thread), the saturated worst case is 2T. At 48-token inputs batch 8 misses 150 ms (2T + 30 = 159 ms) and batch 4 fits (108 ms). **Decisions: `max_length = 48`, `max_batch_size = 4`, queue limit 8 per worker.** | Run I, table 6 |
+
+The first six rows describe the 2026-11-06 runs on ~26-token inputs. Where the follow-up rows
+disagree with them, the follow-up rows are current.
 
 ## Setup
 
@@ -44,6 +50,17 @@ at N=100.
 | S | `scripts/bench_batching.py` | sklearn (iris) | n/a | 100 | `stage1-sklearn_classifier-20261106T150255Z.json` |
 | B | `scripts/bench_batching_1.py` | DistilBERT | **4** | 300 | `stage1-transformer_classifier-20261106T151131Z.json` |
 | C | `scripts/bench_batching_1.py` | DistilBERT | 8 | 300 | `stage1-transformer_classifier-20261106T151327Z.json` |
+| D | `scripts/bench_batching_1.py` | DistilBERT, 10 tokens | 4 | 300 | `stage1-transformer_classifier-20261110T093840Z.json` |
+| E | `scripts/bench_batching_1.py` | DistilBERT, 98 tokens | 4 | 300 | `stage1-transformer_classifier-20261110T094516Z.json` |
+| F | `scripts/bench_batching_1.py` | DistilBERT, 128 tokens | 4 | 300 | `stage1-transformer_classifier-20261110T095534Z.json` |
+| G | `scripts/bench_batching_1.py` | DistilBERT, 48 tokens | 4 | 300 | `stage1-transformer_classifier-20261110T103413Z.json` |
+| H | `scripts/bench_batching_1.py` | DistilBERT, 64 tokens | 4 | 300 | `stage1-transformer_classifier-20261110T104036Z.json` |
+| I | `scripts/bench_batching_1.py` | DistilBERT, 48 tokens, batch 4 and 8 only | 4 | 1000 | `stage1-transformer_classifier-20261110T105742Z.json` |
+| J | `scripts/bench_batching.py`, in a Linux container | DistilBERT, 48 tokens, batch 4 and 8 only | 4 | 1000 | `stage1-transformer_classifier-20261110T121123Z.json` |
+| K | `scripts/bench_batching.py`, in a Linux container | DistilBERT, 48 tokens, batch 4 and 8 only | 8 | 1000 | `stage1-transformer_classifier-20261110T121918Z.json` |
+
+Runs A–C and S use ~26-token inputs (24 words). Runs D–I are the input-length follow-up, described
+in [the follow-up section](#follow-up-2026-11-10-input-length-and-the-worker-loop).
 
 ### Run A: first run, all 8 threads
 
@@ -193,21 +210,37 @@ thread, loses almost nothing to the GIL.
 
 ### Table 4: does the 150 ms p99 target hold? (4 threads)
 
-The worker overlaps collecting the next batch with computing the current one. The worst-case
-model-side wait for a request depends on load, with T = p99 time of a full batch:
+The worker has two threads (design decision D7). A **compute thread** runs one batch at a time,
+and a **collector thread** builds the next batch from the Redis queue while the current one runs.
+The collector holds **at most one formed batch** ahead of the running one. Stage 3 must enforce
+this; otherwise more batches pile up inside the worker, where the queue limit can't see them.
 
-| Situation | Formula | Batch size 16 (T = 54.6) | Batch size 8 (T = 33.4) |
-|---|---|---|---|
-| Light load | max_wait + T | 69.6 ms | 48.4 ms |
-| Saturated | 2T | 109.2 ms | 66.9 ms |
-| At backpressure threshold (one full batch queued per worker) | 3T | **163.8 ms** | 100.3 ms |
+T = p99 time of a full batch. The worst-case model-side wait for one request:
 
-Even using the median instead of p99, batch size 16 at the threshold is 3 × 51.8 = 155 ms. That
-misses 150 ms with no room left for Redis, JSON or HTTP. Batch size 8 leaves about 50 ms for that
-overhead, and costs 18% of peak throughput (253 vs 309 items/s).
+| Situation | What the request waits for | Formula | Batch 16 (T = 54.6) | Batch 8 (T = 33.4) |
+|---|---|---|---|---|
+| Light load | its batch fills or `max_wait` passes, then runs | max_wait + T | 69.6 ms | 48.4 ms |
+| Busy (a batch is running, the request's batch is forming) | the running batch, then its own | 2T | 109.2 ms | 66.9 ms |
+| Saturated (a batch is running, the next is already formed) | the running batch, the formed one, then its own | **3T** | **163.8 ms** | **100.3 ms** |
+| Each additional full batch queued ahead in Redis | one more batch | +T | +54.6 ms | +33.4 ms |
 
-(Light load only reaches max_wait + T if the batch fills up. At light load, batches are usually
+**Batch size 16 can't meet the target under saturation, whatever the queue limit.** Even with an
+empty queue, a request can wait for three batches: 164 ms at p99, and 155 ms at the median. That's
+over 150 ms before any Redis, JSON or HTTP overhead. Batch size 8 gives 100 ms, leaving room for
+overhead, at a cost of 18% of peak throughput (253 vs 309 items/s).
+
+(Light load only reaches max_wait + T if the batch fills up; at light load, batches are usually
 smaller and faster, so these are upper bounds.)
+
+**Correction to the printed output of runs A–C.** The "Latency budget" block the scripts print
+used an earlier version of this model. It listed "saturated" as 2T and "at backpressure threshold"
+(one batch queued ahead) as 3T. It missed that, under saturation, the collector has usually
+already formed the next batch, so 3T is reached even with an empty queue, and a queued batch adds a
+4th T. The table above is the corrected model. The script output is kept as recorded. The script's
+budget function is updated in Stage 3, together with the collector rule it depends on.
+
+> **Superseded (2026-11-10):** the collector thread was removed, so the saturated case is 2T. See
+> [the follow-up section](#follow-up-2026-11-10-input-length-and-the-worker-loop).
 
 ### Sklearn
 
@@ -217,23 +250,165 @@ overhead (Python, input validation). Strictly, batching does lower the per-item 
 far more than it saves. So batching stays off for this model, for that reason rather than the
 original one ("batching doesn't help").
 
+### The queue limit (backpressure threshold)
+
+Before enqueueing, the API rejects a request with 503 if the queue is already at its limit
+(design decision D6). That limit should come from the latency budget: how many requests can
+wait in the queue and still be served within 150 ms.
+
+**First proposal, rejected in review:** `limit = max_batch_size × workers`. It works for the
+transformer, but the sklearn model runs with `max_batch_size = 1`, so its limit would be 1 per
+worker. With one worker, any burst of a few requests would get 503s, even though each one
+takes 0.12 ms and the queue would clear almost instantly. The formula mixed up two different
+things: **batch size** is how much work runs together, and the **queue limit** is how much waiting
+is acceptable.
+
+**Derivation from the budget.** With `d` requests ahead of it in Redis, a request in a
+saturated worker waits for the running batch, the formed batch, and `ceil((d + 1) / B)` batches
+from the queue, the last of which is its own (B = `max_batch_size`):
+
+```
+worst case  = T × (2 + ceil((d + 1) / B))  ≤  target − overhead
+
+m = floor((target − overhead) / T) − 2        # batches from the queue that fit, incl. its own
+max_queue_depth = m × B × workers             # reject with 503 when queue length ≥ this
+                                              # m < 1 means the target is infeasible at this B
+```
+
+With multiple workers on one queue, the queue drains `workers` times faster, hence the
+`× workers`. Values, with target = 150 ms and overhead = 30 ms. The overhead is an
+**assumption**: Redis, JSON and HTTP costs are measured in Stage 2 and the values recomputed:
+
+| Model | B | T (p99 of a full batch) | m | max_queue_depth per worker | Worst case (+ overhead) |
+|---|---|---|---|---|---|
+| Transformer | 8 | 33.4 ms | floor(120 / 33.4) − 2 = 1 | **8** | 100.3 + 30 = 130 ms |
+| Transformer | 16 | 54.6 ms | floor(120 / 54.6) − 2 = 0 | infeasible | 163.8 + 30 = 194 ms |
+| sklearn | 1 | 0.28 ms | floor(120 / 0.28) − 2 = 426 | **426** | ≈ 120 ms |
+
+The sklearn figure uses model-only time. In the real server, each request also costs Redis round
+trips, which raise its effective T and lower its limit. It will still be in the hundreds, not 1.
+
+> **Superseded (2026-11-10):** with the collector removed, `− 2` becomes `− 1`, and the
+> transformer values are recomputed for 48-token inputs in table 6.
+
+**Where the limit lives (options considered):**
+
+| Option | Verdict |
+|---|---|
+| A. A fixed floor: `max(B, floor) × workers` | Rejected: patches the symptom with a magic number and keeps the wrong formula. |
+| **B. A per-version setting, `max_queue_depth`, defaulting to the derived value** | **Chosen.** Each version already stores its own `max_batch_size` and `max_wait_ms`; the queue limit belongs next to them. TF Serving (`max_enqueued_batches`) and Triton (`max_queue_size` in its queue policy) both configure it per model. |
+| C. Keep `B × workers` and accept it | Rejected: knowingly ships needless 503s for the cheapest model. |
+
+## Follow-up (2026-11-10): input length and the worker loop
+
+Two things changed the conclusions above. A design review pointed out that every run so far used
+~26-token inputs, while the runner allowed 128, and a batch pads to its longest input. It also
+showed that the collector thread itself causes the middle T of the 3T worst case. Runs D–I measure
+input length; all use 4 threads.
+
+### Table 5: input length (batch size 8 unless stated)
+
+| Tokens | p50 (ms) | p90 (ms) | p99 (ms) | Per-item speedup at batch 32 | Throughput at batch 8 (items/s) | Run (file) |
+|---|---|---|---|---|---|---|
+| 10 | 19.5 | 19.7 | 21.5 | 10.6× | 411 | D (`…20261110T093840Z.json`) |
+| 26 | 31.6 | 31.8 | 33.4 | 4.6× | 253 | B (`…20261106T151131Z.json`) |
+| 48 | 48.3 | 51.6 | 89.8 | 3.0× | 166 | G (`…20261110T103413Z.json`) |
+| 48 (1,000 iters) | 48.0 | 50.4 | 64.5 | n/a | 167 | I (`…20261110T105742Z.json`) |
+| 64 | 62.0 | 66.4 | 76.0 | 2.3× | 129 | H (`…20261110T104036Z.json`) |
+| 98 | 92.5 | 95.4 | 109.2 | 1.8× | 86 | E (`…20261110T094516Z.json`) |
+| 128 | 122.3 | 125.6 | 162.6 | 1.8× | 65 | F (`…20261110T095534Z.json`) |
+
+**Batch time tracks total padded tokens, not request count.** Batches with similar totals take
+similar time (p50): 32 × 10 tokens = 320 → 42.4 ms (D), 16 × 26 = 416 → 51.8 ms (B), 4 × 98 = 392
+→ 51.7 ms (E). Past roughly 400 tokens per batch the CPU is fully used, and each extra token costs
+about 0.12 ms (8 × 128 = 1,024 tokens → 122.3 ms, F). So short inputs leave the CPU underused and
+batching fills it, while long inputs fill it alone: at 128 tokens throughput is flat at about
+65 items/s from batch 4 upward (F).
+
+**Noise at 48 tokens.** Run G's batch-8 p99 (89.8 ms) is higher than at 64 tokens (76.0 ms, H),
+which can't reflect real cost. With 300 samples p99 is the 3rd-slowest batch. Run I repeated
+batch 4 and 8 at 1,000 iterations; its 64.5 ms is the figure used.
+
+**Unexplained:** at 98 tokens, batch 16 has p99 = 550.9 ms and a worse per-item cost than batch 8
+(E). Possibly cache effects on larger tensors, or thermal throttling after several runs. It's not
+a configuration we would deploy, so it is noted rather than investigated.
+
+### Table 6: the budget at 48 tokens, with the worker pulling a batch only when compute is free
+
+Without the collector thread, a saturated request waits for the running batch and then its own:
+`worst case = T × (1 + ceil((d + 1) / B))`, so `m = floor((target − overhead) / T) − 1`.
+Overhead is still the assumed 30 ms.
+
+| | Batch 4 | Batch 8 |
+|---|---|---|
+| p50 / p99 batch time at 48 tokens (run I) | 29.2 / 38.9 ms | 48.0 / 64.5 ms |
+| Saturated, empty queue: 2T + 30 | **108 ms** | 159 ms (over) |
+| m = floor(120 / T) − 1 | 2 | 0 |
+| `max_queue_depth` per worker = m × B | **8** | infeasible |
+| Worst case at the limit (7 ahead): 3T + 30 | 147 ms | |
+| Throughput, one worker (run I) | 137 items/s | 167 items/s |
+
+64 tokens doesn't fit even at the median (62.0 ms at batch 8, run H), so 48 is the longest
+measured length that works.
+
+### Table 7: native vs Docker container (48 tokens, 1,000 iterations)
+
+Runs J and K use the original `bench_batching.py` (the `_1` copy relies on macOS `sysctl`;
+measurement code is identical) inside `python:3.12-slim` on Docker Desktop, 8 vCPUs. The container
+is native ARM (`uname -m` → `aarch64`), not emulated.
+
+| | Native, 4 threads (I) | Container, 4 threads (J) | Container, 8 threads (K) |
+|---|---|---|---|
+| Batch 4: p50 / p99 | 29.2 / 38.9 ms | 80.8 / 159.3 ms | 77.4 / 151.4 ms |
+| Batch 8: p50 / p99 | 48.0 / 64.5 ms | 141.0 / 149.4 ms | 131.6 / 223.9 ms |
+| Batch 4 throughput | 137 items/s | 49 items/s | 52 items/s |
+
+The container is about 2.8× slower, and even a batch of 4 has p99 over 150 ms. Likely cause, not
+separated by experiment: macOS PyTorch's matrix math most likely goes through Apple's Accelerate
+library, which can use M1 matrix hardware a Linux guest can't reach, and the VM hides the P/E
+core split. So all later performance numbers are measured natively (decision 6 below).
+
 ## Decisions
 
-Status: **proposed, pending confirmation.** This section will be updated when confirmed.
+### Current decisions (2026-11-10)
+
+These replace decisions 2, 3, 4 and 7 below. Full entries: `docs/DESIGN.md`, C1.11 to C1.14.
+
+1. **Worker loop: no collector thread.** The worker pulls a batch from Redis only when compute is
+   free, so every waiting request stays where `LLEN` can see it. Saturated worst case: 2T.
+   (C1.11; reasoning, applied to T from runs B and I.)
+2. **`max_length = 48` tokens, per model version and immutable.** The latency target is stated for
+   inputs up to that length. (C1.13; runs B, D–I.)
+3. **Main model `max_batch_size = 4`.** Batch 8 misses 150 ms at 48 tokens. Cost: 137 vs
+   167 items/s. Revisited once Stage 2 measures overhead. (C1.14; run I.)
+4. **`max_queue_depth` = 8 per worker** for the transformer (m = 2). (C1.14; run I.)
+5. **Latency target as two guarantees:** p99 < 150 ms at ≤ 70% load, and accepted requests under
+   overload still finish within 150 ms. (C1.12.)
+6. **Benchmarks run natively** (API and worker with `uv run`, Redis in Docker), with open-loop
+   load. Containers are built but are not where numbers come from. (C1.15; runs I, J, K.)
+
+### Original decisions (2026-11-07)
+
+Status: **confirmed 2026-11-07. Decisions 2, 3, 4 and 7 are superseded by the list above.**
 
 1. **Inference threads = number of performance cores** (4 on this M1). On machines where all
    cores are the same (typical Linux servers), use the physical core count. The Stage 11 layout
    comparison becomes 1×4, 2×2 and 4×1 on this machine, plus one 8-thread layout to show the
    effect of the efficiency cores under load.
-2. **Main model `max_batch_size`: 16 → 8**, so the worst case at the backpressure threshold fits
-   the 150 ms target with headroom for network overhead. Trade-off: −18% peak throughput per
-   worker. Stage 11 re-measures this end to end.
-3. **Backpressure threshold = `max_batch_size × workers`** (was the fixed `16 × workers`), so it
-   stays one full batch per worker if the batch size changes.
+2. **Main model `max_batch_size`: 16 → 8.** At 16, a saturated worker can't meet 150 ms even with
+   an empty queue (3T = 164 ms). At 8 it's 100 ms. Trade-off: −18% peak throughput per worker.
+   Stage 11 re-measures this end to end.
+3. **Queue limit: a new per-version setting, `max_queue_depth`** (option B above), defaulting to
+   `m × max_batch_size × workers` from the budget derivation. This is a new column on
+   `model_versions`, added in Stage 5; until then it comes from config. Current values: 8 per worker
+   (transformer), recomputed for both models once Stage 2 measures overhead.
 4. **"Target load" = at most 70% of a worker's measured throughput.** The p99 < 150 ms target
-   applies there. The saturated and threshold cases are overload, where 503s take over.
+   applies there. Saturation is overload, where 503s take over.
 5. **`max_wait` stays at 15 ms** until the Stage 11 sweep.
-6. **sklearn stays at `max_batch_size = 1`**, with the reason corrected as above.
+6. **sklearn stays at `max_batch_size = 1`**, because waiting up to 15 ms to fill a batch costs far
+   more than its 0.12 ms inference, not because batching has no effect.
+7. **Stage 3 requirement: the collector holds at most one formed batch ahead of the running
+   one.** The latency model and the queue limit both depend on this.
 
 ## Reproduce
 
@@ -246,6 +421,20 @@ uv run python -m scripts.bench_batching   --model-dir artifacts/sentiment-v1    
 uv run python -m scripts.bench_batching   --kind sklearn_classifier --model-dir artifacts/iris-v1  # run S
 uv run python -m scripts.bench_batching_1 --model-dir artifacts/sentiment-v1 --threads 4 --iters 300  # run B
 uv run python -m scripts.bench_batching_1 --model-dir artifacts/sentiment-v1 --threads 8 --iters 300  # run C
+
+# follow-up runs, 4 threads
+uv run python -m scripts.bench_batching_1 --model-dir artifacts/sentiment-v1 --threads 4 --iters 300 --words 8    # run D
+uv run python -m scripts.bench_batching_1 --model-dir artifacts/sentiment-v1 --threads 4 --iters 300 --words 96   # run E
+uv run python -m scripts.bench_batching_1 --model-dir artifacts/sentiment-v1 --threads 4 --iters 300 --words 140  # run F
+uv run python -m scripts.bench_batching_1 --model-dir artifacts/sentiment-v1 --threads 4 --iters 300 --words 46   # run G
+uv run python -m scripts.bench_batching_1 --model-dir artifacts/sentiment-v1 --threads 4 --iters 300 --words 62   # run H
+uv run python -m scripts.bench_batching_1 --model-dir artifacts/sentiment-v1 --threads 4 --iters 1000 --words 46 --batch-sizes 4,8  # run I
+
+# runs J and K: same measurement inside a Linux container (keeps the Mac's .venv and uv.lock untouched)
+docker run --rm -it -v "$PWD":/app -w /app -e UV_PROJECT_ENVIRONMENT=/tmp/venv python:3.12-slim \
+  sh -c "pip install -q uv && uv sync --extra worker --frozen && \
+    uv run python -m scripts.bench_batching --model-dir artifacts/sentiment-v1 --threads 4 --iters 1000 --words 46 --batch-sizes 4,8 && \
+    uv run python -m scripts.bench_batching --model-dir artifacts/sentiment-v1 --threads 8 --iters 1000 --words 46 --batch-sizes 4,8"
 ```
 
 Expect different absolute numbers on other hardware. The patterns are what should carry over:

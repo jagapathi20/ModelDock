@@ -68,6 +68,8 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 6. Enqueue with `request_id`, `reply_to`, and `deadline`.
 7. Await the result future. On timeout, return 504.
 
+> **Changed later:** C1.11 (no collector thread; the worker runs one loop). See [Part 2](#part-2-design-change-log).
+
 ---
 
 ## 4. Locked design decisions
@@ -77,7 +79,7 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - The tiny sklearn model runs with batching off.
 - **Target: p99 < 150 ms at target load** for the main model, from worst case ≈ `max_wait (15 ms) + batch run time + overhead`. Re-check against real measured batch times in Stage 1.
 
-> **Changed later:** C1.1, C1.2, C1.3, C1.9. See [Part 2](#part-2-design-change-log).
+> **Changed later:** C1.1, C1.2, C1.3, C1.9, C1.11, C1.12, C1.13. See [Part 2](#part-2-design-change-log).
 
 ### D2: Synchronous API
 - `POST /v1/models/{name}/predict` is **synchronous**: the response contains the prediction.
@@ -101,6 +103,8 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - Reply lists get an `EXPIRE` that the listener refreshes periodically, so a dead API process's list disappears on its own.
 - Redis is the transport for request queues and reply lists.
 
+> **Changed later:** C1.18 (the worker sets the expiry on each push), C1.19 (the listener supervises itself). See [Part 2](#part-2-design-change-log).
+
 ### D5: Dynamic batching rule
 - The worker **blocks until a request arrives**. That first request starts a clock.
 - It keeps collecting until **`max_batch_size` is reached or `max_wait` has passed since the first request**, whichever comes first, then runs the batch.
@@ -108,7 +112,7 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - `max_wait` mostly matters at light load. `max_batch_size` mostly matters at heavy load, where the queue refills while a batch runs.
 - Both are configurable **per model version**. Starting values for the main model: `max_batch_size = 16`, `max_wait = 15 ms`. The sklearn model uses `max_batch_size = 1`.
 
-> **Changed later:** C1.4 (`max_batch_size` 16 → 8). See [Part 2](#part-2-design-change-log).
+> **Changed later:** C1.4 (`max_batch_size` 16 → 8), C1.11 (what `max_wait` bounds), C1.14 (`max_batch_size` 8 → 4). See [Part 2](#part-2-design-change-log).
 
 ### D6: Backpressure and overload
 - Before enqueuing, the API checks queue depth (`LLEN`). Over the threshold, it **immediately returns 503 Service Unavailable with `Retry-After`**, rather than letting requests wait.
@@ -117,7 +121,7 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - 503 means "the server is overloaded." 429 is reserved for per-client rate limiting (D11).
 - Documented client behavior: **exponential backoff with jitter** on 503, to avoid retry storms. The load-test client implements it.
 
-> **Changed later:** C1.7 (queue limit derived from the budget, per version). See [Part 2](#part-2-design-change-log).
+> **Changed later:** C1.7 (queue limit derived from the budget, per version), C1.11 (formula), C1.14 (value), C1.16 (timeout value), C1.17 (explicit setting, no computed default). See [Part 2](#part-2-design-change-log).
 
 ### D7: CPU usage inside a worker
 - Default: **one worker process per model version, one batch at a time**, with PyTorch's internal threads set explicitly via `torch.set_num_threads(N)` so total threads never exceed cores.
@@ -129,7 +133,7 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - Why not many single-batch processes by default: each holds a copy of the model in RAM, and traffic splits across them, giving smaller batches.
 - Processes × threads-per-process is configurable. The benchmark stage compares **1×8, 2×4, and 4×2** (adjust to the machine's core count).
 
-> **Changed later:** C1.5, C1.6. See [Part 2](#part-2-design-change-log).
+> **Changed later:** C1.5, C1.6, C1.11 (collector thread removed). See [Part 2](#part-2-design-change-log).
 
 ### D8: Model registry and storage
 - **Weights go in object storage** (MinIO locally, S3-compatible such as Cloudflare R2 in deployment) under **immutable keys** that include version and content hash, e.g. `models/sentiment/v3-<sha256prefix>.pt`. A version's file is never overwritten.
@@ -150,6 +154,8 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - Every response carries **`X-Model-Version`**. All metrics are labeled by version.
 - *Reconciliation with D8:* several versions can be `live` at once during a canary. The rule is that the `traffic_percent` values of a model's live versions sum to 100, enforced in a transaction when weights change.
 
+> **Changed later:** C1.22 (stable hash with model name; auth before canary; periodic routing reload). See [Part 2](#part-2-design-change-log).
+
 ### D10: Response cache
 - Redis key: `cache:{model}:{version}:{sha256(canonical_input)}`.
 - **No invalidation is ever needed.** A version is immutable, so `(version, input)` always gives the same answer. A new version simply uses new keys.
@@ -159,6 +165,8 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - Models run in **deterministic eval mode** (no dropout, no sampling).
 - Caching is configurable per model (`cache_enabled`).
 
+> **Changed later:** C1.22 (cache in its own Redis instance). See [Part 2](#part-2-design-change-log).
+
 ### D11: Authentication and rate limiting
 - **API key format:** `sk_<key_id>_<secret>`. Postgres stores `key_id` and the **SHA-256 hash of the secret**, never the plaintext. The full key is shown **once** at creation.
 - Why SHA-256 and not bcrypt: keys are 32 random bytes and can't be brute-forced. Slow hashes exist for low-entropy human passwords, and bcrypt per request would only add latency.
@@ -167,6 +175,8 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - **Rate limiting:** a token bucket per client in Redis (capacity = per-minute limit, continuous refill), implemented as **one atomic Lua script** so concurrent API processes can't double-spend the last token. Limits are configurable per client.
 - Over the limit returns **429** with `Retry-After` and `X-RateLimit-Remaining`.
 - **Fail open:** if Redis is unreachable for the limiter, allow the request and log an error.
+
+> **Changed later:** C1.22 (cached API keys expire, so a missed revocation heals). See [Part 2](#part-2-design-change-log).
 
 ### D12: Reliability
 - **No recovery of in-flight requests** when a worker crashes. Use a plain pop, not Streams with acks. Detecting the crash and reclaiming requests takes longer than the request deadline, so recovered requests would already be expired, and the ack machinery would add Redis operations to every request for no benefit with a synchronous API. (Revisit only if an async bulk-jobs API is added.)
@@ -179,6 +189,8 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - **Health endpoints:**
   - `/health/live`: the process is alive.
   - `/health/ready`: the process can serve. For workers, that means only after the model is downloaded, its hash verified, and **one warm-up batch** run.
+
+> **Changed later:** C1.16 (504 timeout is 500 ms; the no-recovery argument depends on it), C1.19 (the API's readiness includes the reply listener), C1.21 (worker health served from a thread; Docker doesn't act on unhealthy). See [Part 2](#part-2-design-change-log).
 
 ### D13: Observability
 - **Principle:** break latency into stages, each with its own metric:
@@ -201,6 +213,8 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - **Grafana dashboard** with one row per latency stage, plus throughput and outcomes.
 - **Alerts:** p99 > 150 ms for 5 minutes, and 503 rate > 1%.
 
+> **Changed later:** C1.20 (custom buckets, ratio-based SLO alert, one API process per scrape target), C1.21 (worker `/metrics` and health from one HTTP thread). See [Part 2](#part-2-design-change-log).
+
 ### D14: Deployment (two setups)
 **Benchmark setup (local Docker Compose):** the full architecture. Multiple API processes, worker pools per version, Redis, Postgres, MinIO, Prometheus, Grafana, and the Locust load generator. **All performance numbers in the README come from this setup**, with the hardware documented.
 
@@ -212,7 +226,7 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - **Managed backing services:** Neon (Postgres), Upstash (Redis, TLS `rediss://`), Cloudflare R2 (objects). **Verify** that the Redis provider supports what we use (Lua `EVAL`, blocking pops, pub/sub), and estimate Redis commands per request against its free quota.
 - The demo shows **functionality**, not performance.
 
-> **Changed later:** C0.1 (local MinIO image). See [Part 2](#part-2-design-change-log).
+> **Changed later:** C0.1 (local MinIO image), C1.15 (benchmarks run natively), C1.22 (measure memory before the 512 MB demo). See [Part 2](#part-2-design-change-log).
 
 ---
 
@@ -268,6 +282,8 @@ Use migrations (Alembic).
 | `ratelimit:{client_id}` | hash (tokens, last_refill) | token bucket, Lua-managed |
 | `routing:changed` | pub/sub channel | reload routing table |
 | `apikeys:revoked` | pub/sub channel | evict cached key |
+
+> **Changed later:** C1.18 (`replies:*` expiry is set by the worker). See [Part 2](#part-2-design-change-log).
 
 **Request message (JSON):**
 ```json
@@ -348,7 +364,7 @@ Each stage ends with: code, tests, `docs/stages/NN-<name>.md`, a commit message,
 
 **Stage 12: Demo deployment.** The single-container demo image per D14 (quantized small model baked in, process supervisor), managed Postgres, Redis, and object storage, a "warming up" demo page, README section on the architecture, design decisions, benchmark results, and how to run locally.
 
-> **Changed later:** C1.6 and C1.7 add work to Stages 3 and 5; C1.5 changes the Stage 11 layouts. See [Part 2](#part-2-design-change-log).
+> **Changed later:** C1.6 and C1.7 add work to Stages 3 and 5; C1.5 changes the Stage 11 layouts; C1.11 replaces Stage 3's collector and compute threads with one loop; C1.13 makes `max_length` a per-version setting. **C1.23 replaces this build plan** with a reduced first release (core stages, stretch stages, future work). See [Part 2](#part-2-design-change-log).
 
 ---
 
@@ -368,6 +384,8 @@ Async bulk-jobs API, GPU serving, autoscaling, multi-region, Redis Cluster/shard
 - Why API keys use SHA-256 but passwords use bcrypt, constant-time comparison, and distributed rate limiting with an atomic Lua token bucket.
 - Why in-flight requests aren't recovered on crash (deadline vs. detection time, idempotency).
 - Diagnosing latency by stage-level metrics.
+
+> **Changed later:** C1.11 (the collector/compute split was removed). See [Part 2](#part-2-design-change-log).
 
 ---
 
@@ -400,7 +418,15 @@ Entry IDs are `C<stage>.<n>`. "Before" quotes or summarizes Part 1.
 ## Stage 1: model runners and batching measurement
 
 All measurements: Apple M1 (4 performance + 4 efficiency cores), model only (no Redis/HTTP).
-Full report: [`benchmarks/stage-1-batching.md`](benchmarks/stage-1-batching.md).
+Full report: [`benchmarks/stage-1-batching.md`](benchmarks/stage-1-batching.md). Every figure
+below traces to one of these result files, committed in `bench/results/`:
+
+| Run | Script | Model | Threads | Inputs | Iterations | File |
+|---|---|---|---|---|---|---|
+| A | `bench_batching.py` | DistilBERT | 8 | ~26 tokens | 100 | `stage1-transformer_classifier-20261106T150229Z.json` |
+| S | `bench_batching.py` | sklearn (iris) | n/a | 4 features | 100 | `stage1-sklearn_classifier-20261106T150255Z.json` |
+| B | `bench_batching_1.py` | DistilBERT | 4 | ~26 tokens | 300 | `stage1-transformer_classifier-20261106T151131Z.json` |
+| C | `bench_batching_1.py` | DistilBERT | 8 | ~26 tokens | 300 | `stage1-transformer_classifier-20261106T151327Z.json` |
 
 ### C1.1: Measured batching gain is 4.2×, not ~10× (D1)
 
@@ -409,7 +435,11 @@ Full report: [`benchmarks/stage-1-batching.md`](benchmarks/stage-1-batching.md).
   goes from 74 to 309 items/s). Gains flatten after 16: going to 32 adds 11% throughput and nearly
   doubles batch time. At the chosen batch size of 8: 3.4×, 253 items/s.
 - **Why:** D1 asked for its illustrative numbers to be replaced with measured ones.
-- **Evidence:** benchmark runs A, B and C (Table 1 of the report).
+- **Evidence:** Table 1 of the report.
+  - `bench/results/stage1-transformer_classifier-20261106T151131Z.json` (run B): the 4.2×, 3.4×, 74 / 253 / 309 items/s figures
+  - `bench/results/stage1-transformer_classifier-20261106T150229Z.json` (run A) and `bench/results/stage1-transformer_classifier-20261106T151327Z.json` (run C): the same 4.2× with 8 threads
+
+> **Qualified by C1.13:** all these figures are for ~26-token inputs. The gain depends on input length.
 
 ### C1.2: Worst-case latency model corrected (D1)
 
@@ -428,7 +458,10 @@ Full report: [`benchmarks/stage-1-batching.md`](benchmarks/stage-1-batching.md).
 - **Note:** a first version of this model (printed by the Stage 1 benchmark script) put
   "saturated" at 2T. It missed the already-formed batch. That was corrected before any decision
   relied on it; the script's budget output is updated in Stage 3.
-- **Evidence:** Table 4 of the report.
+- **Evidence:** reasoning (Table 4 of the report), with T taken from
+  - `bench/results/stage1-transformer_classifier-20261106T151131Z.json` (run B): T = 54.6 ms at batch 16, 33.4 ms at batch 8
+
+> **Superseded by C1.11:** without the collector thread, the saturated case is 2T, not 3T.
 
 ### C1.3: "Target load" defined (D1)
 
@@ -436,6 +469,11 @@ Full report: [`benchmarks/stage-1-batching.md`](benchmarks/stage-1-batching.md).
 - **After:** target load = **at most 70% of a worker's measured throughput**. The 150 ms p99
   target applies there. Saturation is overload, where 503s (D6) are the intended response.
 - **Why:** a latency target needs a defined load to be testable (Stage 11).
+- **Evidence:** a definition, not a measurement. The throughput it refers to (253 items/s at
+  batch 8) is from
+  - `bench/results/stage1-transformer_classifier-20261106T151131Z.json` (run B)
+
+> **Superseded by C1.12:** two guarantees, one for normal load and one for overload.
 
 ### C1.4: Main model `max_batch_size` 16 → 8 (D5)
 
@@ -444,7 +482,10 @@ Full report: [`benchmarks/stage-1-batching.md`](benchmarks/stage-1-batching.md).
 - **Why:** at 16, a saturated worker's worst case is 3T = 164 ms (p99), over 150 ms even with an
   empty queue and before network overhead. At 8 it is 100 ms. Cost: 18% lower peak throughput
   per worker (253 vs 309 items/s).
-- **Evidence:** run B, Table 4 of the report.
+- **Evidence:** Table 4 of the report.
+  - `bench/results/stage1-transformer_classifier-20261106T151131Z.json` (run B): T at batch 16 and 8, and the 253 vs 309 items/s
+
+> **Superseded by C1.14:** `max_batch_size = 4`, once inputs up to 48 tokens were measured.
 
 ### C1.5: Inference threads = number of performance cores (D7)
 
@@ -456,7 +497,10 @@ Full report: [`benchmarks/stage-1-batching.md`](benchmarks/stage-1-batching.md).
 - **Why:** with 8 threads on the M1, each operation waits for the slowest (efficiency) core.
   Compared with 4 threads at batch size 16: median 5% slower, p99 about 2× worse
   (107.8 vs 54.6 ms). With 4 threads, p99 is within 6% of the median.
-- **Evidence:** runs B vs C (Table 2), reproduced by run A.
+- **Evidence:** Table 2 of the report.
+  - `bench/results/stage1-transformer_classifier-20261106T151131Z.json` (run B): 4 threads
+  - `bench/results/stage1-transformer_classifier-20261106T151327Z.json` (run C): 8 threads, same method
+  - `bench/results/stage1-transformer_classifier-20261106T150229Z.json` (run A): an independent 8-thread run showing the same tail (p99 88.3 ms at batch 16)
 
 ### C1.6: The collector holds at most one formed batch ahead (D7)
 
@@ -465,7 +509,10 @@ Full report: [`benchmarks/stage-1-batching.md`](benchmarks/stage-1-batching.md).
   forming the next batch only once the compute thread has taken the previous one.
 - **Why:** batches held inside the worker are invisible to the queue-depth check (D6) and add
   latency. The latency model (C1.2) and the queue limit (C1.7) both assume this bound.
+- **Evidence:** reasoning about the worker design; no benchmark run.
 - **Implemented in:** Stage 3.
+
+> **Superseded by C1.11:** the collector thread is removed, so no batch is formed ahead.
 
 ### C1.7: Queue limit derived from the latency budget, stored per version (D6, section 5)
 
@@ -487,6 +534,11 @@ Full report: [`benchmarks/stage-1-batching.md`](benchmarks/stage-1-batching.md).
   was chosen over a fixed floor (a magic number) and over accepting the 503s. TF Serving and Triton
   also configure queue limits per model.
 - **Evidence:** "queue limit" section of the report.
+  - `bench/results/stage1-transformer_classifier-20261106T151131Z.json` (run B): T = 33.4 ms (transformer, batch 8)
+  - `bench/results/stage1-sklearn_classifier-20261106T150255Z.json` (run S): T = 0.28 ms (sklearn, p99 at batch 1)
+
+> **Amended by C1.11 and C1.14:** the formula's `− 2` becomes `− 1`, and the transformer value is
+> recomputed for batch size 4 and 48-token inputs. The per-version setting itself is unchanged.
 
 ### C1.8: Why the contrast model doesn't batch (section 2, D5)
 
@@ -495,7 +547,8 @@ Full report: [`benchmarks/stage-1-batching.md`](benchmarks/stage-1-batching.md).
 - **After:** measured cost is a flat **0.12 ms** per call for 1 to 32 items, so batching *does*
   cut per-item cost (15× at 16). It stays off because waiting up to `max_wait` (15 ms) to fill a
   batch costs far more than the 0.12 ms it would save. `max_batch_size = 1` is unchanged.
-- **Evidence:** run S.
+- **Evidence:**
+  - `bench/results/stage1-sklearn_classifier-20261106T150255Z.json` (run S): 0.12 ms per call from 1 to 32 items
 
 ### C1.9: Transformer input truncated at 128 tokens (D1, new)
 
@@ -503,6 +556,10 @@ Full report: [`benchmarks/stage-1-batching.md`](benchmarks/stage-1-batching.md).
 - **After:** inputs are truncated to `max_length = 128` tokens (configurable).
 - **Why:** a batch is padded to its longest input, so one very long input would slow every request
   in its batch. Capping the length bounds the worst-case batch time that C1.2 relies on.
+- **Evidence:** reasoning; 128 was not measured when this was decided (it was later, in
+  - `bench/results/stage1-transformer_classifier-20261110T095534Z.json` (run F)
+
+> **Superseded by C1.13:** `max_length = 48`, per version and immutable, not global config.
 
 ### C1.10: Worker-only dependencies; CPU-only PyTorch (D3, section 7)
 
@@ -512,6 +569,528 @@ Full report: [`benchmarks/stage-1-batching.md`](benchmarks/stage-1-batching.md).
   from PyTorch's CPU-only wheel index; PyPI's Linux wheel is the CUDA build with ~3 GB of
   unused NVIDIA libraries.
 - **Why:** D3 says API processes never load models; packaging now enforces it.
+- **Evidence:** packaging change; no benchmark run.
+
+## Stage 1 follow-up: design audit and input-length runs (2026-11-10)
+
+Two sources: a design review of the whole plan (risks R1 and R2 led to the entries below), and six
+more benchmark runs at different input lengths. Same machine and method as Stage 1: Apple M1,
+4 threads, model only. New result files in `bench/results/`:
+
+| Run | Words → tokens | Iterations | Batch sizes | File |
+|---|---|---|---|---|
+| D | 8 → 10 | 300 | 1–32 | `stage1-transformer_classifier-20261110T093840Z.json` |
+| E | 96 → 98 | 300 | 1–32 | `stage1-transformer_classifier-20261110T094516Z.json` |
+| F | 140 → 128 (truncated) | 300 | 1–32 | `stage1-transformer_classifier-20261110T095534Z.json` |
+| G | 46 → 48 | 300 | 1–32 | `stage1-transformer_classifier-20261110T103413Z.json` |
+| H | 62 → 64 | 300 | 1–32 | `stage1-transformer_classifier-20261110T104036Z.json` |
+| I | 46 → 48 | **1000** | 4, 8 | `stage1-transformer_classifier-20261110T105742Z.json` |
+
+The "Latency budget" block these runs print still uses the old formulas (fixed in Stage 3).
+Ignore it; the budgets below are computed by hand from the measured T.
+
+### C1.11: Worker loop pulls a batch only when compute is free (D5, D7; replaces C1.6, amends C1.2, C1.7)
+
+- **Before:** a collector thread builds the next batch while the compute thread runs the current
+  one, handing it over through an in-process queue (D7), limited to one formed batch ahead (C1.6).
+- **After:** **one loop, no collector thread.** Block for the first request. Take whatever is
+  already queued, up to `max_batch_size`, in one Redis call (`LPOP key count`, Redis ≥ 6.2). If the
+  batch isn't full, wait for more only until `max_wait` has passed since the first request's
+  `enqueued_at_ms`. Run the batch, push the replies, repeat. The worker keeps helper threads only
+  for metrics and health.
+- **Latency model (replaces C1.2's saturated rows):** with d requests ahead in Redis and
+  B = `max_batch_size`,
+  ```
+  worst case = T × (1 + ceil((d + 1) / B))      # running batch, then the batches up to its own
+  m = floor((target − overhead) / T) − 1         # batches from the queue that fit (was − 2)
+  max_queue_depth = m × B × workers
+  ```
+  Light load is still `max_wait + T`. Saturated with an empty queue is **2T** (was 3T).
+- **D5 wording:** `max_wait` bounds how long a batch stays open while compute is idle. It does
+  not bound how long a request waits for its batch to start under load.
+- **Why:**
+  - The formed batch is the middle T of C1.2's 3T. It's a full batch of backlog that has left
+    Redis, so under load the backlog can never be smaller than one batch, and the `LLEN` check
+    (D6) can't see it.
+  - The obvious implementation (a handoff queue of size 1) is worse: one batch running, one in the
+    queue, one held by the collector blocked on `put()`, giving 4T. Getting C1.6's 3T needed an
+    extra rule; this loop needs none.
+  - With every waiting request in Redis, the queue limit controls the whole backlog.
+  - Less code: one loop instead of two threads, a handoff queue and a rule.
+- **Trade-off:** collecting no longer overlaps computing. Under load the requests are already in
+  Redis, so collecting costs one round trip. Stage 2 measures it to confirm it is small next to T.
+- **Status:** decided 2026-11-10.
+- **Evidence:** reasoning from C1.2 (risk R1 of the audit), not yet measured end to end. The T
+  values the formula is applied to come from
+  - `bench/results/stage1-transformer_classifier-20261106T151131Z.json` (run B)
+  - `bench/results/stage1-transformer_classifier-20261110T105742Z.json` (run I)
+
+### C1.12: Latency target as two guarantees (D1, D6; replaces C1.3)
+
+- **Before (C1.3):** the 150 ms p99 target applies at ≤ 70% load; "saturation is overload, where
+  503s take over."
+- **What broke:** C1.4 chose batch size 8 because batch size 16 misses 150 ms *under saturation*.
+  If the target didn't apply under saturation, that reasoning would not hold. The two entries
+  contradicted each other.
+- **After:**
+  1. **Normal operation (≤ 70% of measured worker throughput):** end-to-end p99 < 150 ms, and
+     essentially no 503s. 70% leaves room for bursts, since queue wait grows sharply as
+     utilization approaches 100%.
+  2. **Overload (above that):** the server sheds load with 503 + `Retry-After`. **Requests it
+     accepts still complete within 150 ms**, because `max_queue_depth` is derived from that
+     budget. That is the purpose of the 503 threshold, and why batch size is chosen for the
+     saturated case.
+- **Both apply only to inputs up to `max_length` tokens** (C1.13).
+- **Evidence:** the budgets behind guarantee 2 use T from
+  - `bench/results/stage1-transformer_classifier-20261110T105742Z.json` (run I): batch 4 vs 8 at 48 tokens
+- **Open follow-up:** P10 (what "measured throughput" means, and whether guarantee 2 is a target
+  that the load test verifies).
+
+### C1.13: Input length is part of the latency target; `max_length` 128 → 48 (D1, D10; replaces C1.9)
+
+- **Before (C1.9):** `max_length = 128`, a global config setting. T was measured only on
+  ~26-token inputs.
+- **What broke:** a batch pads to its longest input, and at 128 tokens one batch of 8 alone takes
+  162.6 ms at p99, over the whole target. The budget held only for short inputs.
+- **Findings (batch size 8, 4 threads):**
+
+  | Tokens per input | p50 (ms) | p99 (ms) | Per-item speedup at batch 32 | Run |
+  |---|---|---|---|---|
+  | 10 | 19.5 | 21.5 | 10.6× | D |
+  | 26 | 31.6 | 33.4 | 4.6× | B |
+  | 48 | 48.1 | 64.5 | 3.0× | I (G for speedup) |
+  | 64 | 62.0 | 76.0 | 2.3× | H |
+  | 98 | 92.5 | 109.2 | 1.8× | E |
+  | 128 | 122.3 | 162.6 | 1.8× | F |
+
+  - **Batch time tracks total padded tokens, not request count.** Batches with similar totals take
+    similar time: 32 × 10 tokens (320) 42 ms, 16 × 26 (416) 52 ms, 4 × 98 (392) 52 ms. Past
+    roughly 400 tokens per batch the CPU is fully used, and each extra token costs about 0.12 ms.
+  - **So batching helps less as inputs get longer.** Short inputs leave the CPU underused and
+    batching fills it; long inputs fill it alone. At 128 tokens throughput is flat at about
+    65 items/s from batch size 4 up.
+- **After:**
+  - The latency target (C1.12) is stated for inputs **up to `max_length` tokens**.
+  - **`max_length = 48`**: the longest measured length where a small batch still fits the budget
+    (64 tokens fails even at the median, see C1.14).
+  - `max_length` is **part of the model version and immutable**, like the weights. Changing it
+    changes outputs for the same input (a long text truncated at 48 vs 128 can get a different
+    label), which would silently make D10's cached answers stale.
+  - Longer inputs are truncated, keeping the start. The API also caps input size in characters,
+    since it has no tokenizer (P8).
+- **Why 48 is acceptable:** the model was fine-tuned on SST-2, single sentences from movie reviews,
+  so long multi-paragraph texts are outside what it was trained on anyway.
+- **Rejected:** budgeting for 128 tokens (even one batch of 8 misses 150 ms, and short inputs would
+  get needless 503s). **Future work:** token-budget batching, which caps each batch by total
+  padded tokens so T stays steady whatever the input length.
+- **Unexplained:** at 98 tokens, batch size 16 has p99 = 551 ms and a worse per-item cost than
+  batch size 8 (run E). Possibly cache effects on larger tensors, or thermal throttling after
+  several runs. It's a configuration we won't deploy, so it is noted rather than investigated.
+- **Evidence:**
+  - `bench/results/stage1-transformer_classifier-20261110T093840Z.json` (run D): 10 tokens
+  - `bench/results/stage1-transformer_classifier-20261106T151131Z.json` (run B): 26 tokens
+  - `bench/results/stage1-transformer_classifier-20261110T103413Z.json` (run G): 48 tokens, all batch sizes (incl. the 3.0× speedup)
+  - `bench/results/stage1-transformer_classifier-20261110T105742Z.json` (run I): 48 tokens, batch 4 and 8, 1,000 iterations (the 64.5 ms p99)
+  - `bench/results/stage1-transformer_classifier-20261110T104036Z.json` (run H): 64 tokens
+  - `bench/results/stage1-transformer_classifier-20261110T094516Z.json` (run E): 98 tokens (incl. the unexplained 551 ms p99 at batch 16)
+  - `bench/results/stage1-transformer_classifier-20261110T095534Z.json` (run F): 128 tokens
+
+### C1.14: Main model `max_batch_size` 8 → 4; queue limit recomputed (D5, D6; replaces C1.4)
+
+- **Before (C1.4):** `max_batch_size = 8`, chosen on 26-token inputs.
+- **What broke:** at 48 tokens, batch-8 p99 is 64.5 ms (run I, 1,000 iterations), so the
+  saturated worst case 2T + 30 ms = 159 ms misses the 150 ms target.
+- **After:**
+
+  | | Batch 4 | Batch 8 |
+  |---|---|---|
+  | p50 / p99 at 48 tokens (run I) | 29.2 / 38.9 ms | 48.1 / 64.5 ms |
+  | Saturated worst case, 2T + 30 ms | **108 ms** | 159 ms |
+  | Throughput, one worker | 137 items/s | 167 items/s |
+
+  - **`max_batch_size = 4`.** `max_wait` stays 15 ms.
+  - **`max_queue_depth` = 8 per worker:** m = floor((150 − 30) / 38.9) − 1 = 2, so 2 × 4 = 8.
+    Worst case at the limit (7 requests ahead): 3T + 30 = 147 ms.
+  - Sklearn under the C1.11 formula: m ≈ 427, still hundreds per worker on model-only timing.
+- **Why not stretch to 8:** it misses by only 9 ms, but the 30 ms overhead is still an
+  assumption. If measured overhead is 20 ms, batch 8 lands at 149 ms, too thin a margin to derive
+  the queue limit from.
+- **Trade-off:** 18% less peak throughput per worker (137 vs 167 items/s).
+- **Revisit:** after Stage 2 measures real overhead, and in the load-test stage (batch size 4 vs 8
+  end to end). Switching is a one-number config change.
+- **Note on p99 noise:** run G (300 iterations) gave batch-8 p99 = 89.8 ms at 48 tokens, higher
+  than at 64 tokens, which can't reflect real cost. With 300 samples p99 is the 3rd-slowest batch.
+  Run I repeated it with 1,000 iterations; its value is the one used.
+- **Evidence:**
+  - `bench/results/stage1-transformer_classifier-20261110T105742Z.json` (run I): all figures in the table above
+  - `bench/results/stage1-transformer_classifier-20261110T103413Z.json` (run G): the noisy 89.8 ms p99 at 300 iterations
+  - `bench/results/stage1-transformer_classifier-20261110T104036Z.json` (run H): 64 tokens fails even at the median (62.0 ms)
+  - `bench/results/stage1-sklearn_classifier-20261106T150255Z.json` (run S): sklearn T for its queue limit
+
+### C1.15: Benchmarks run natively, not in Docker Compose (D14, C1.5; resolves P5)
+
+- **Before (D14):** "All performance numbers in the README come from [the Docker Compose] setup."
+- **What broke:** on macOS, Docker runs containers inside a Linux VM. The same benchmark inside a
+  container (48 tokens, 1,000 iterations, `python:3.12-slim`, 8 vCPUs) was about **2.8× slower**:
+
+  | | Native, 4 threads (run I) | Container, 4 threads (run J) | Container, 8 threads (run K) |
+  |---|---|---|---|
+  | Batch 4: p50 / p99 | 29.2 / 38.9 ms | 80.8 / 159.3 ms | 77.4 / 151.4 ms |
+  | Batch 8: p50 / p99 | 48.0 / 64.5 ms | 141.0 / 149.4 ms | 131.6 / 223.9 ms |
+  | Batch 4 throughput | 137 items/s | 49 items/s | 52 items/s |
+
+  In the container, even one batch of 4 has p99 over 150 ms, so no queue limit could meet the
+  target there, and none of the Stage 1 numbers would apply.
+- **Not emulation:** `docker run --rm python:3.12-slim uname -m` printed `aarch64`, so the container
+  ran native ARM code.
+- **Likely cause (not separated by experiment):** macOS PyTorch most likely does its matrix math
+  through Apple's Accelerate library, which can use the M1's matrix hardware that a Linux guest
+  can't reach, and the forward pass is 98% matrix multiplies (Table 3 of the report). The VM also
+  hides the P/E core split, so its vCPUs may run on efficiency cores, which fits the worse tail.
+  4 vs 8 threads is not meaningful inside the VM for the same reason.
+- **After:**
+  - **All README performance numbers come from a native setup:** API and worker run with `uv run`
+    on macOS; only Redis runs in Docker. The hardware is stated with every number.
+  - Dockerfiles and the Compose setup are still built (graceful shutdown, restart policy, the
+    kill-a-worker demo). They show the system runs in containers; they are not where numbers come
+    from.
+  - The README states two limitations: the load generator shares the machine, and container
+    inference on macOS measured 2.8× slower (with the reason above).
+  - C1.5 (threads = performance cores) stays valid, since it was measured in the environment the
+    benchmarks run in.
+- **Also decided from audit risk R3** (applies to the load-test stage): load must be **open-loop**
+  (fixed arrival rate), and README percentiles come from the load generator, not from Prometheus
+  histograms. Locust's `constant_throughput` only caps each user's rate and still waits for each
+  reply, so it is open-loop only approximately; a fixed-arrival-rate executor (e.g. k6
+  `constant-arrival-rate`) is the stricter choice. The tool is picked in that stage.
+- **Evidence:**
+  - `bench/results/stage1-transformer_classifier-20261110T105742Z.json` (run I): native baseline
+  - `bench/results/stage1-transformer_classifier-20261110T121123Z.json` (run J): container, 4 threads
+  - `bench/results/stage1-transformer_classifier-20261110T121918Z.json` (run K): container, 8 threads
+  - The `uname -m` check above (output `aarch64`).
+
+### C1.16: Request timeout is 500 ms (D6, D12; resolves P6)
+
+- **Before:** D6 sets each request's deadline to "arrival time + client timeout", and D12 returns
+  504 "when the handler's timeout fires". Neither gave the timeout a value.
+- **After:** one server setting, **`request_timeout_ms = 500`**. It sets both `deadline_ms`
+  (arrival + 500 ms) and the API's 504 timer. 503 responses send **`Retry-After: 1`**.
+- **Why a timeout is bounded on both sides:**
+  - **Not at or near the 150 ms target (e.g. 150 or 200).** The p99 target is statistical: 1% of
+    requests may be a little slower. A timeout is a hard cutoff, so setting it at the target turns
+    slow-but-fine requests into 504s. The worker drops a request whose deadline passed before
+    compute (P9), but one that expires mid-batch is computed and its reply discarded, so the work is
+    wasted. Clients then retry, adding load exactly when the server is slow (a retry storm). And
+    the 147 ms worst case (C1.14) rests on an assumed 30 ms overhead and on p99s that showed one-off
+    spikes, so 200 ms leaves too little margin over an unmeasured number.
+  - **Not very high (e.g. 1 s or 30 s).** The queue limit already caps how long an accepted
+    request can legitimately take (about 147 ms). A request still waiting far beyond that is not
+    slow but broken: a hung or dead worker, or a lost reply. A long timeout only keeps the client
+    waiting for that failure. Meanwhile every stuck request holds an HTTP connection and a
+    futures-map entry, so a hung worker piles up thousands of them and turns a worker failure
+    into an API failure. The client may disconnect first, so the worker's deadline check would
+    be computing for clients that are gone.
+  - **Rule:** the timeout is the point past which slowness means failure. 500 ms is about 3× the
+    worst case an accepted request should take: room for noise and unmeasured overhead, while a
+    broken request fails within half a second.
+- **Dependency on D12:** D12 skips recovering in-flight requests after a worker crash because
+  detecting the crash takes longer than the deadline, so recovered requests would already be
+  expired. That holds only while the deadline is short. A multi-second timeout would make
+  recovery worth building (Redis Streams with acks).
+- **`Retry-After`:** HTTP's `Retry-After` takes whole seconds, so 1 is the smallest value, longer
+  than the queue takes to drain. The load-test client's backoff with jitter may start lower.
+- **Revisit:** after Stage 2 measures overhead; the measured end-to-end p99 should sit well below
+  500 ms (P12).
+- **Evidence:** reasoning; no benchmark run. The 147 ms worst case comes from
+  `bench/results/stage1-transformer_classifier-20261110T105742Z.json` (run I, via C1.14).
+
+### C1.17: `max_queue_depth` is an explicit setting, computed offline (D6, C1.7; resolves P7)
+
+- **Before (C1.7):** a per-version `max_queue_depth` *defaulting to* the budget formula
+  `m × max_batch_size × workers`, with m from T and overhead (C1.11).
+- **What broke:** the API enforces the limit, but it knows only two of the formula's five inputs:
+
+  | Input | Who knows it | API can get it? |
+  |---|---|---|
+  | target (150 ms) | config | yes |
+  | `max_batch_size` | per-version config | yes |
+  | overhead | nobody at runtime (a Stage 2 benchmark result) | no |
+  | T | only the worker, which runs the model (D3) | no |
+  | workers | nobody, and it changes on crash or restart | no |
+
+- **After:**
+  - `max_queue_depth` is an **explicit per-version setting** holding the **total for that
+    version's queue**. There is no computed default.
+  - The benchmark script prints the recommended value from the C1.11 formula; the value is set
+    from that, by hand.
+  - Changing the number of workers for a version means changing this setting. The docs say so.
+- **Rejected: computing it live** (workers publish T and heartbeats to Redis; the API recomputes).
+  T depends on input length (C1.13), so a burst of long inputs would lower the limit and a burst
+  of short ones would raise it: the limit would swing from moment to moment, making it hard to
+  test and explain. It also adds heartbeats, staleness rules and a fallback, each a new failure
+  mode.
+- **How production systems do it:** model servers use a fixed, configured limit tuned by load
+  testing, as here: Triton (`max_queue_size` in the dynamic-batching queue policy), TensorFlow
+  Serving (`max_enqueued_batches`), TorchServe (`job_queue_size`). General backend services often
+  adapt the limit live, but from observed latency, not from T × workers: Netflix's
+  `concurrency-limits` library and Envoy's adaptive concurrency filter. Limiting time spent
+  waiting rather than queue length is another common approach; the worker's deadline drops (P9)
+  are this project's time-based limit, behind the length-based one.
+- **Known limitation:** the limit assumes a fixed worker count. If one of two workers crashes, the
+  queue drains at half speed while the limit stays the same, so some accepted requests miss
+  150 ms. Deadline drops and 504s catch the worst cases, and the worker restarts (D12).
+  **Future work:** an adaptive, latency-based limit.
+- **Evidence:** reasoning; no benchmark run. Current recommended value (8 per worker for the
+  transformer) comes from
+  `bench/results/stage1-transformer_classifier-20261110T105742Z.json` (run I, via C1.14).
+
+### C1.18: The worker sets the reply list's expiry (D4, section 6; resolves P11)
+
+- **Before (D4):** "Reply lists get an `EXPIRE` that the listener refreshes periodically, so a dead
+  API process's list disappears on its own."
+- **What broke:** two Redis facts. A list that becomes empty is deleted, and `EXPIRE` on a key that
+  doesn't exist does nothing (it stores no expiry for later).
+  - **While the API process is alive**, its listener pops replies almost as soon as they arrive,
+    so the list is almost always empty and the key doesn't exist. The periodic refresh almost
+    always does nothing.
+  - **After the API process dies**, workers still finish its in-flight batches and `RPUSH` their
+    replies. The push creates a new key with no expiry. The refresh and the pops both ran in the
+    dead process, so nothing ever expires or empties that key: it stays forever, and every crash
+    leaves another one.
+- **After:** the worker sends `RPUSH replies:{api_instance_id} <reply>` and
+  `EXPIRE replies:{api_instance_id} 60` together in one pipeline (one round trip; `MULTI`/`EXEC` if
+  it must be atomic). The listener no longer refreshes anything. Rule: **whoever creates the key
+  sets its expiry.** 60 s is far above the 500 ms request timeout (C1.16); a reply older than that
+  is useless anyway.
+- **Rejected: a pub/sub channel per API process.** It stores nothing, so there is nothing to
+  clean up, and `PUBLISH` even reports 0 receivers when the process is gone. But pub/sub is
+  at-most-once: a reply published while the listener is disconnected (a brief network blip, a
+  reconnect) is dropped, and that client gets a 504 after 500 ms and retries. A slow listener
+  can also be disconnected by Redis once its output buffer limit is hit, losing more. A list
+  holds replies until popped, so after a 200 ms gap the listener catches up and the clients get
+  normal, slightly late responses.
+- **Rule this follows:** pub/sub where losing a message is harmless, lists where it isn't.
+  `routing:changed` and `apikeys:revoked` stay on pub/sub because a periodic reload repairs a
+  missed message (P17); replies use lists because a lost reply is a failed request.
+- **Section 6 change:** `replies:{api_instance_id}` is "list (expiry set by the worker on each
+  push)", not "list (with refreshed EXPIRE)".
+- **Evidence:** documented Redis behaviour (empty lists are deleted; `EXPIRE` on a missing key
+  returns 0; pub/sub does not store messages); no benchmark run.
+
+### C1.19: The reply listener supervises itself; readiness reflects it (D4, D12; resolves P12)
+
+- **Before (D4):** "Each API process runs one background listener on its reply list and resolves
+  an in-memory map `request_id → asyncio.Future`." Nothing said what happens if it fails.
+- **What broke:** the listener is one asyncio task looping on `BLPOP`. If Redis restarts, `BLPOP`
+  raises a connection error, and if nothing catches it the task ends. Redis never reconnects to
+  clients; clients reconnect themselves. redis-py's pool gives ordinary commands a fresh
+  connection, so handlers keep enqueueing and workers keep pushing, but no code calls `BLPOP`
+  any more. Every request in that API process then waits on a future nobody resolves and gets a
+  504; replies pile up in its reply list until they expire (C1.18). `/health/live` still returns
+  200, and an exception in an un-awaited task is only logged ("Task exception was never
+  retrieved") when the task is garbage-collected. A **silent failure**: worse than a crash,
+  because a crash is restarted (D12) and this isn't.
+- **After:**
+  - **Errors are caught inside the loop; the task never exits.** On a connection error it waits,
+    then retries. A single bad message (e.g. malformed JSON) is logged and skipped, so one reply
+    can't stop the listener for everyone.
+  - **Retries use capped exponential backoff with jitter** (cap about 1 s). Retrying instantly
+    would spin the CPU and flood logs, and every API process retrying at once when Redis returns
+    could overload it (a thundering herd). The low cap keeps recovery quick.
+  - **A dedicated Redis connection** for the listener, since `BLPOP` keeps its connection busy
+    while waiting. `BLPOP` timeout 1 s; socket timeout longer (e.g. 2 s), or every idle wait would
+    be reported as a timeout error.
+  - **Readiness, not liveness.** The loop wakes at least once a second (the `BLPOP` timeout) and
+    records a last-iteration timestamp. The API's `/health/ready` is false when it is older than
+    3 s, which catches both a crashed and a stuck listener. `/health/live` stays
+    dependency-free: not live means "restart me", which can't fix Redis and would cause a restart
+    loop; not ready means "stop sending me traffic", and traffic returns once the listener
+    recovers.
+  - **Futures-map entries are removed in `finally`** in the handler, so success, timeout (504),
+    a failed enqueue and cancellation all clean up. Removing it only on timeout would leak an
+    entry per request whenever the enqueue fails, growing fastest during an outage. Use
+    `pending.pop(request_id, None)`, which doesn't raise if the entry is already gone. Late
+    replies then find no entry and are discarded (D4).
+  - **The listener checks `fut.done()` before `set_result`.** A handler can time out at the same
+    moment its reply arrives; `set_result` on a finished or cancelled future raises
+    `InvalidStateError`, which, uncaught, would kill the listener.
+- **Evidence:** documented redis-py and asyncio behaviour; no benchmark run.
+
+### C1.20: Latency buckets around the target; one API process per scrape target (D13; resolves P13)
+
+- **Before (D13):** histograms with no bucket boundaries specified, so `prometheus_client`'s
+  defaults; "API processes expose `/metrics` via FastAPI"; alert on "p99 > 150 ms for 5 minutes".
+- **What broke (buckets):** a Prometheus histogram keeps, per bucket, a counter of requests that
+  took at most that long (since process start). Prometheus scrapes the counters; the time window
+  is chosen at query time, e.g. `histogram_quantile(0.99, rate(latency_bucket[5m]))`, which
+  assumes requests are spread evenly inside a bucket. The default boundaries jump from 0.1 s to
+  0.25 s, so a 150 ms target sits inside one 150 ms-wide bucket. Example: 1,000 requests, 900 at
+  ≤ 100 ms and 100 between 100 and 250 ms gives an estimated p99 of 100 + 0.9 × 150 = 235 ms,
+  whether those 100 requests took 140 ms or 160 ms. The alert could neither tell 140 from 160 nor
+  report the real value. Grafana's p99 graph is computed from the same buckets, so it has the
+  same blind spot.
+- **What broke (processes):** with `uvicorn --workers N`, N processes share one port and each
+  keeps its own counters. A scrape reaches whichever process the OS picks, so Prometheus sees one
+  process's share (e.g. 600, 400, 610, 405), never the total. `rate()` reads each drop as a
+  counter reset after a restart and counts the full value again, filling graphs with false spikes.
+- **After:**
+  - **Custom buckets** for latency histograms:
+    `0.025, 0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2, 0.25, 0.5, 1` s, with a boundary exactly
+    at the 150 ms target.
+  - **The SLO alert uses an exact ratio, not the interpolated p99:**
+    `rate(latency_bucket{le="0.15"}[5m]) / rate(latency_count[5m]) < 0.99`. Both are exact counts,
+    so no interpolation is involved. The interpolated p99 stays on dashboards.
+  - **README percentiles come from the load generator** (as in C1.15).
+  - **One API process per instance**, each scraped as its own target and summed at query time
+    with `sum(...)`. No `--workers N`. Natively (C1.15), the load tests run two API processes on
+    two ports, and the load generator spreads requests across both.
+- **Rejected: `prometheus_client` multiprocess mode** (each process writes metrics to files in a
+  shared directory; `/metrics` merges them). It works, but needs the directory cleared at startup
+  and a merge mode for gauges, and some features don't support it. One process per scrape target
+  is simpler and matches how containers are scaled.
+- **Evidence:** documented Prometheus and `prometheus_client` behaviour; no benchmark run.
+
+### C1.21: Worker health served from a thread inside the worker; one stage owns the containers (D12, D13, section 8; resolves P14)
+
+- **Before:** D12 gives the worker a `/health/ready` (true only after the model is loaded, its hash
+  verified and a warm-up batch run). D13 has workers expose `/metrics` with `prometheus_client`'s
+  `start_http_server`. The Stage 0 doc says app containers arrive "Stage 9 onward".
+- **What broke:**
+  - The worker is a plain Python loop, not a web server, and `start_http_server` serves metrics
+    only, so `/health/ready` had nowhere to live.
+  - No stage's description includes writing the Dockerfiles.
+- **Why not a separate health process:** whether the model has loaded and when the loop last ran
+  exist only as variables in the worker process's memory. Another process can't read them without
+  extra machinery, and loading its own copy of the model would double the RAM (against D3) while
+  saying nothing about the worker's copy or its loop.
+- **After:**
+  - **The worker runs a small HTTP server in a background thread** of the same process, serving
+    `/metrics`, `/health/live` (always 200) and `/health/ready`. It shares memory with the main
+    loop, so it reads the loop's flags directly.
+  - **Worker readiness:** model loaded, hash verified, warm-up batch run (a `ready` flag set by the
+    loop), **and** the main loop ran within the last 3 s (a `last_loop_at` timestamp updated every
+    iteration; the loop's blocking pop has a 1 s timeout, so it wakes at least once a second even
+    when idle). Same pattern as the API listener in C1.19.
+  - **Cost:** one mostly idle thread. A health check reads two variables, so it holds the GIL for
+    microseconds, and the forward pass (98% of batch time, Table 3 of the benchmark report)
+    releases the GIL anyway.
+  - **Why this thread is fine when the collector thread (C1.11) wasn't:** the collector held
+    requests, forming batches early, which hid backlog from `LLEN` and added a batch of latency.
+    The health thread holds no requests; it only reads flags.
+  - **One stage owns the Dockerfiles** (API and worker images) and the Compose services: the
+    containers-and-reliability stage of the revised plan (P4).
+  - **Compose healthchecks use Python,** since `python:3.12-slim` has no `curl`:
+    `python -c "import urllib.request; urllib.request.urlopen('http://localhost:9101/health/ready')"`.
+- **Documented limitation:** plain Docker does not act on "unhealthy". `restart: unless-stopped`
+  restarts a container only when its process exits; an unhealthy one keeps running. Compose uses
+  health status only for `depends_on: condition: service_healthy`. Orchestrators such as
+  Kubernetes act on liveness and readiness. Locally, health checks give visibility and startup
+  ordering, not automatic recovery.
+- **Evidence:** documented `prometheus_client` and Docker behaviour; no benchmark run.
+
+### C1.22: Fixes for the routing, invalidation, cache and demo designs (D9, D10, D11, D14; resolves P17)
+
+These apply to stages the revised plan may defer (P4). Recording them now keeps those stages from
+rediscovering the problems; it does not commit to building them.
+
+**R10a. Sticky routing uses a stable hash (D9).**
+- **Before:** `hash(client_id) % 100`.
+- **What broke:** Python mixes a random per-process seed into string hashes (a defence against
+  hash-flooding attacks on dictionaries). Two API processes compute different buckets for the same
+  client, so its requests flip between versions depending on which process answers. Fixing the
+  seed with `PYTHONHASHSEED` would work only if every process set it; forgetting it once breaks
+  routing silently.
+- **After:** `bucket = int.from_bytes(sha256(f"{model}:{client_id}").digest()[:8], "big") % 100`,
+  identical in every process, on every machine and in every language. Buckets are compared with
+  cumulative weights (v1 90%, v2 10%: buckets 0–89 → v1, 90–99 → v2).
+- **Model name in the hash:** each model's canary group is an independent slice of clients, so the
+  same few clients don't test every new version of every model.
+- **Canary range grows from the top** (10% = 90–99, 20% = 80–99), so clients already in the canary
+  stay there as it grows and nobody flips between versions during a rollout.
+
+**R10b. Auth is built before canary routing; canary tests use many clients (D9, D11, section 8).**
+- **What broke:** routing needs `client_id`, which first exists with API keys (old Stage 8), but
+  canary routing was old Stage 6. Alternatives are worse: a client-supplied `X-Client-Id` lets a
+  client choose its own bucket, and an IP address changes (mobile networks) or is shared by many
+  users (NAT).
+- **After:** if canary routing is built, authentication comes first, and the routing key is the
+  authenticated `client_id`.
+- **Testing:** each client occupies one bucket, so with few clients the canary's real share is
+  coarse (3 clients and a 10% canary give 0% or 33%). A canary load test uses a few hundred API
+  keys, one per simulated user.
+
+**R11. Pub/sub invalidations are backed by periodic reloads (D9, D11).**
+- **What broke:** pub/sub is at-most-once (C1.18). An API process that misses `routing:changed`
+  keeps a stale routing table forever; one that misses `apikeys:revoked` keeps accepting a revoked
+  key forever.
+- **After:** API processes also reload the routing table periodically (e.g. every 30 s), and cached
+  API keys expire (e.g. after 30 s). Pub/sub still makes changes fast in the normal case; the
+  reload bounds staleness to about 30 s when a message is missed.
+
+**R12. The response cache gets its own Redis instance (D10).**
+- **What broke:** `maxmemory-policy` applies to a whole Redis instance. `allkeys-lru` can evict
+  request queues and rate-limit buckets. `volatile-lru` evicts only keys with an expiry, and since
+  C1.18 reply lists have one, so replies could be evicted before the listener pops them.
+- **After:** a second Redis instance holds only `cache:*` keys, with `maxmemory` and LRU eviction.
+  The main instance keeps no eviction policy.
+
+**R13. Measure memory before committing to the 512 MB demo (D14).**
+- **What broke:** D14 assumes Python, PyTorch, a quantized model and two processes fit in about
+  512 MB. Not measured.
+- **After:** measure the resident memory of the API and worker processes (with the demo model)
+  before choosing the free tier. If they don't fit, the demo needs a bigger instance or a smaller
+  runtime.
+
+- **Evidence:** documented Python, Redis and HTTP behaviour; no benchmark run.
+
+### C1.23: Scope of the first release and the revised build plan (section 8; resolves P4)
+
+- **Before (section 8):** 13 stages, 0 to 12, all to be built.
+- **Why it changed:** 11 stages remained after Stage 1, which would take weeks to build well,
+  while the goal is to start applying for backend roles soon. The first release builds what
+  backend interviews probe most (concurrency, queues, timeouts, failure behaviour, load shedding,
+  measured results) and lists the rest as future work with its design already written.
+- **After:** the build plan below **replaces section 8** for implementation. Same deliverables per
+  stage (code, tests, `docs/stages/NN-<name>.md`, commit message, verify commands), one stage per
+  response.
+- **Consequences:** models and versions come from config (`sentiment` v1, `iris` v1), not a
+  registry. Queue names stay `q:{model}:{version}`, so the registry and canary routing can be added
+  later without renaming. MinIO leaves Compose; Postgres returns only with S1. The README claims
+  only what is built.
+
+**Core (ModelDock is resume-ready when these are done)**
+
+| Stage | Contents | Decisions it implements |
+|---|---|---|
+| 1.5 Housekeeping | Commit `bench/results/` (remove it from `.gitignore`); delete `temp.py`; remove MinIO (and Postgres, until S1) from Compose. | C1.15, C1.23 |
+| 2 Queue round trip | Predict endpoint. Input validation per runner kind, limits from per-version config, input-size cap. `request_timeout_ms = 500` sets `deadline_ms` and the 504 timer. Futures map cleaned in `finally`; listener checks `fut.done()`. Self-supervising listener on a dedicated connection; API `/health/ready`. Worker pops one request, checks its deadline, replies with `RPUSH` + `EXPIRE 60` in one pipeline. Reply carries an error code. Then **measure overhead** (end-to-end minus `inference_ms`, p50 and p99). | C1.16, C1.18, C1.19; P3, P8, P9 |
+| 3 Batching | Pull-when-ready loop: block for the first request, `LPOP key count` up to `max_batch_size = 4`, wait for more only until `max_wait` (15 ms) after the first request's `enqueued_at_ms`. `max_length = 48` per version. Deadline check just before compute. A failed batch replies with an error to every request in it. Thread caps for PyTorch and numpy/BLAS. Timings in the reply. Benchmark script prints the C1.11 budget and the recommended `max_queue_depth`. | C1.11, C1.13, C1.14, C1.17; P9, P15 |
+| 4 Backpressure | Explicit per-version `max_queue_depth` (total for the queue), 503 with `Retry-After: 1`, counter for expired requests. Recompute the queue limit from the overhead measured in Stage 2. | C1.16, C1.17 |
+| 5 Containers and reliability | Dockerfiles for API and worker; both in Compose. Worker health/metrics HTTP thread (`/metrics`, `/health/live`, `/health/ready` with the 3 s loop check). SIGTERM handling in both (blocking pops use a 1 s timeout so the loop notices). A script that kills a worker under load. Containers are not used for benchmark numbers. | C1.15, C1.21; D12 |
+| 6 Metrics and logs | D13 metrics with custom buckets (boundary at 0.15 s); SLO ratio alert rule; JSON logs with `request_id` in both process types; Prometheus scraping each API process and the worker as separate targets. | C1.20 |
+| 7 Load tests | Native setup (two API processes on two ports, worker, Redis in Docker). Open-loop load; client with exponential backoff and jitter on 503. Results: batching on vs off, `max_batch_size` 4 vs 8, a `max_wait` sweep, overload behaviour. Define target load from the measured end-to-end saturation throughput. Percentiles from the load generator. | C1.12, C1.14, C1.15; P10, optional P16 |
+| 8 README | Architecture, decisions (linking this document), results with hardware, limitations (shared machine, container slowdown, unhealthy containers not restarted, fixed queue limit on worker crash), future work. Resume bullets from measured numbers only. | all |
+
+If a core stage overruns, drop the `max_wait` sweep from Stage 7 before dropping anything else.
+
+**Stretch (after the core, in this order)**
+
+| Stage | Contents | Decisions |
+|---|---|---|
+| S1 Rate limiting | Postgres back in Compose; `clients` and `api_keys` tables; key format with hex-only parts (so `sk_<key_id>_<secret>` splits unambiguously); SHA-256 + constant-time compare; key cache with expiry and `apikeys:revoked`; Lua token bucket; 429 headers; fail open. | D11, C1.22 (R11) |
+| S2 Response cache | Separate Redis instance with `maxmemory` + LRU; canonical input hash; TTL; one hit-rate benchmark. | D10, C1.22 (R12) |
+| S3 Grafana | One dashboard provisioned from files, one row per latency stage. | D13 |
+
+**Future work (designed, not built in the first release)**
+
+- Model registry and object storage (old Stage 5), with P1 (runner type) and P2 (tar artifacts).
+- Canary routing (old Stage 6), with C1.22's stable hash, auth first and periodic reload.
+- Live demo (old Stage 12), after measuring memory (C1.22, R13).
+- Process × thread layout comparison (C1.5).
+- Token-budget batching for longer inputs (C1.13).
+- An adaptive, latency-based queue limit (C1.17).
+
+- **Evidence:** scope judgment from the design audit, accepted 2026-11-20; no benchmark run.
 
 ---
 
@@ -519,13 +1098,23 @@ Full report: [`benchmarks/stage-1-batching.md`](benchmarks/stage-1-batching.md).
 
 | Parameter | Initial design | Current | Change |
 |---|---|---|---|
-| Main model `max_batch_size` | 16 | **8** | C1.4 |
+| Main model `max_batch_size` | 16 | **4** | C1.4, C1.14 |
 | Main model `max_wait` | 15 ms | 15 ms | |
-| Main model input length | unspecified | **128 tokens** | C1.9 |
+| Main model input length | unspecified | **48 tokens, per version, immutable** | C1.9, C1.13 |
+| Worker loop | collector thread + compute thread | **one loop, pulls a batch when compute is free** | C1.6, C1.11 |
+| Saturated worst case (empty queue) | not modelled | **2T** | C1.2, C1.11 |
 | Inference threads (M1) | ≤ cores (8) | **4 (performance cores)** | C1.5 |
-| Queue limit | 16 × workers | **`max_queue_depth` per version, from the budget (8 per worker, provisional)** | C1.7 |
-| p99 target | < 150 ms at target load | < 150 ms at **≤ 70% of measured throughput** | C1.3 |
+| Queue limit | 16 × workers | **`max_queue_depth`: explicit per-version total, set from the benchmark's recommendation (8 per worker for the transformer, provisional until overhead is measured)** | C1.7, C1.11, C1.14, C1.17 |
+| p99 target | < 150 ms at target load | < 150 ms for inputs ≤ 48 tokens: **at ≤ 70% load, and for accepted requests under overload** | C1.3, C1.12 |
 | Contrast model `max_batch_size` | 1 | 1 (rationale corrected) | C1.8 |
+| Benchmark environment | Docker Compose | **Native macOS (Redis in Docker), open-loop load** | C1.15 |
+| Request timeout (deadline and 504) | unspecified | **500 ms**; 503s send `Retry-After: 1` | C1.16 |
+| Reply-list expiry | refreshed by the API's listener | **set by the worker on each push (60 s)** | C1.18 |
+| API readiness | not specified for the API | **false if the reply listener's last loop is older than 3 s** | C1.19 |
+| Latency SLO alert | p99 > 150 ms (interpolated) | **fraction of requests ≤ 150 ms < 0.99, from a bucket at exactly 0.15 s** | C1.20 |
+| API processes | multiple per port | **one per instance, each scraped separately** | C1.20 |
+| Scope | 13 stages, all built | **7 core stages + housekeeping; 3 stretch; registry, canary and demo deferred** | C1.23 |
+| Worker health endpoints | `/health/ready` with no server to host it | **HTTP thread in the worker: `/metrics`, `/health/live`, `/health/ready`** | C1.21 |
 | Local object storage | MinIO | MinIO (Chainguard build) | C0.1 |
 
 ---
@@ -534,14 +1123,41 @@ Full report: [`benchmarks/stage-1-batching.md`](benchmarks/stage-1-batching.md).
 
 Not yet decided. When one is agreed, it moves to Part 2 under the stage that implements it.
 
-- **P1: runner type in the registry (section 5, Stage 5).** The schema has no field saying which
+- **P1: runner type in the registry (section 5; deferred with the registry, C1.23).** The schema has no field saying which
   runner loads a model (transformer vs sklearn). Proposal: a `runtime` column on `models`
   (`transformer_classifier` / `sklearn_classifier`).
-- **P2: model artifacts as one archive (D8, Stage 5).** D8's example key
+- **P2: model artifacts as one archive (D8; deferred with the registry, C1.23).** D8's example key
   `models/sentiment/v3-<hash>.pt` assumes one file, but a saved Hugging Face model is a directory
   (`config.json`, `model.safetensors`, tokenizer files). Proposal: store each version as one
   `.tar`, so the immutable key, SHA-256 check and hash-keyed cache work unchanged.
 - **P3: per-model input validation in the API (Stages 2–3).** One malformed input in a batch makes
   the whole batch fail. Proposal: the API validates input against a per-model schema before
   enqueueing, and the worker returns a batch failure as an error to every request in it rather
-  than leaving them to time out.
+  than leaving them to time out. *Audit note:* the API never loads a model (D3), and the sklearn
+  feature count lives inside `model.joblib`, so validation limits (feature count, max characters)
+  must sit in per-version config the API can read. The reply message also needs an error code.
+
+The proposals below come from the design audit of 2026-11-10. Risks R1 and R2 are decided
+(C1.11, C1.13, C1.14). The rest are not yet reviewed.
+
+- **P4: scope.** Decided: see C1.23.
+- **P5: where benchmark numbers come from.** Decided: see C1.15.
+- **P6: request timeout.** Decided: see C1.16.
+- **P7: `max_queue_depth` is explicit.** Decided: see C1.17.
+- **P8: input size cap at the API (C1.13).** About 250 characters as a proxy for 48 tokens. Reject
+  (413) or truncate: decide in Stage 2.
+- **P9: deadline checks (Stages 2–3).** Check at pop and again just before compute. A dropped
+  request gets no reply, only a counter; the API has already returned 504.
+- **P10: target-load definition (C1.12).** The only measured throughput is model-only and native.
+  Proposal: define 70% against end-to-end saturation throughput from the load test, and treat
+  guarantee 2 as a target the load test verifies, since the bound adds p99s and the queue limit is
+  soft.
+- **P11: reply-list expiry.** Decided: see C1.18.
+- **P12: listener failure.** Decided: see C1.19.
+- **P13: metrics.** Decided: see C1.20.
+- **P14: containers and worker health.** Decided: see C1.21.
+- **P15: thread caps for numpy/BLAS (D7).** Set the thread environment variables before numpy is
+  imported, so total threads stay within the performance cores.
+- **P16: sklearn batching (C1.8).** C1.8's reason argues for `max_wait_ms = 0`, not for
+  `max_batch_size = 1`. Proposal: try `max_wait_ms = 0` with a larger batch size in the load test.
+- **P17: recorded for deferred stages.** Decided: see C1.22.

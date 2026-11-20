@@ -30,8 +30,10 @@ uv run python -m scripts.bench_batching --model-dir artifacts/sentiment-v1
 ## Benchmark results
 
 - [Stage 1: batching and CPU threads](docs/benchmarks/stage-1-batching.md): on an Apple M1,
-  batching 16 requests makes each 4.2× cheaper, and limiting PyTorch to the 4 performance
-  cores cuts p99 batch time at batch size 16 from 107.8 ms to 54.6 ms.
+  batching 16 requests of ~26 tokens makes each 4.2× cheaper, and limiting PyTorch to the
+  4 performance cores cuts p99 batch time at batch size 16 from 107.8 ms to 54.6 ms. The gain
+  depends on input length: 10.6× at batch 32 for 10-token inputs, 1.8× for 128-token inputs,
+  because batch time tracks total tokens (see [`docs/DESIGN.md`](docs/DESIGN.md), C1.13).
 
 ## Checks
 
