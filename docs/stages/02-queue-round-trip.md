@@ -354,8 +354,29 @@ load test checks guarantee 2 (accepted requests finish within 150 ms under overl
 
 The sklearn model's inference takes a fraction of a millisecond, so for iris `e2e` is almost
 pure overhead, a cross-check for the sentiment figure, which subtracts a much larger inference
-time. **No numbers are recorded yet:** C2.6 gets them, with their result files, after the
-benchmark runs natively on the M1.
+time.
+
+**Results** (Apple M1, native; full table and reasoning in C2.6):
+
+| p99, ms | iris | sentiment |
+|---|---|---|
+| end to end | 1.28 | 19.45 |
+| inference | 0.22 | 17.83 |
+| overhead | 1.10 | 1.77 |
+
+Overhead is under 2 ms, against 30 ms assumed. Consequences, worked out in C2.6:
+
+- `max_queue_depth` stays 8 per worker at batch 4, and the worst case for an accepted request at
+  the limit drops from 146.7 to 118.5 ms.
+- Batch size 8, rejected in C1.14 because it missed 150 ms by 9 ms under the assumption, now fits
+  on paper (130.8 ms). It is *not* adopted: the measured overhead is a lower bound, so the
+  question goes to the load test as open proposal P19.
+
+Evidence: `bench/results/stage2-overhead-iris-20261122T092735Z.json`, `bench/results/stage2-overhead-sentiment-20261122T093415Z.json`.
+
+How to read the split: `http_ms` (client to handler and back) is the largest part, then `rpc_ms`
+(the Redis round trips, JSON and validation), then queue wait (the worker waking from `BLPOP`).
+None dominates, so there's no single thing to optimise; at under 2 ms total, nothing needs to be.
 
 ## 9. Tests
 

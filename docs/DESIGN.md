@@ -737,6 +737,9 @@ Ignore it; the budgets below are computed by hand from the measured T.
   - `bench/results/stage1-transformer_classifier-20261110T104036Z.json` (run H): 64 tokens fails even at the median (62.0 ms)
   - `bench/results/stage1-sklearn_classifier-20261106T150255Z.json` (run S): sklearn T for its queue limit
 
+> **Revisited in C2.6:** measured overhead is 1.77 ms (p99, light load), not 30 ms. Batch 8 would
+> fit (130.8 ms saturated); batch 4 stays until the load-test stage compares them end to end (P19).
+
 ### C1.15: Benchmarks run natively, not in Docker Compose (D14, C1.5; resolves P5)
 
 - **Before (D14):** "All performance numbers in the README come from [the Docker Compose] setup."
@@ -814,6 +817,9 @@ Ignore it; the budgets below are computed by hand from the measured T.
 - **Evidence:** reasoning; no benchmark run. The 147 ms worst case comes from
   `bench/results/stage1-transformer_classifier-20261110T105742Z.json` (run I, via C1.14).
 
+> **Revisited in C2.6:** with measured overhead the worst case at the queue limit is 118.5 ms; the
+> 500 ms timeout is unchanged.
+
 ### C1.17: `max_queue_depth` is an explicit setting, computed offline (D6, C1.7; resolves P7)
 
 - **Before (C1.7):** a per-version `max_queue_depth` *defaulting to* the budget formula
@@ -853,6 +859,9 @@ Ignore it; the budgets below are computed by hand from the measured T.
 - **Evidence:** reasoning; no benchmark run. Current recommended value (8 per worker for the
   transformer) comes from
   `bench/results/stage1-transformer_classifier-20261110T105742Z.json` (run I, via C1.14).
+
+> **Revisited in C2.6:** with measured overhead (1.77 ms) the recommendation is still 8 per worker
+> for the transformer at batch 4; Stage 4 sets it, and the load test checks it (P10).
 
 ### C1.18: The worker sets the reply list's expiry (D4, section 6; resolves P11)
 
@@ -1269,10 +1278,49 @@ Not specified before Stage 2; decided while building it.
   - **Stage 4** uses it provisionally to recompute `max_queue_depth` (C1.17). **Stage 7's load
     test** checks whether accepted requests under overload really finish within 150 ms
     (guarantee 2, C1.12), which is what P10 asks.
-- **Result:** not yet run. The figures and their result files
-  (`bench/results/stage2-overhead-{iris,sentiment}-*.json`) are added in a follow-up commit, once
-  the benchmark has been run natively on the M1.
-- **Evidence:** pending.
+- **Result** (Apple M1, native, one API process, one worker, Redis in Docker; 1,000 sequential
+  requests after 50 warm-up, all 200; sentiment inputs 46 words, about 48 tokens):
+
+  | ms | iris p50 | iris p99 | sentiment p50 | sentiment p99 |
+  |---|---|---|---|---|
+  | End to end | 1.09 | 1.28 | 18.04 | 19.45 |
+  | Inference (in the worker) | 0.15 | 0.22 | 16.50 | 17.83 |
+  | **Overhead** (end to end − inference) | **0.94** | **1.10** | **1.54** | **1.77** |
+  | of which HTTP (client to handler) | 0.44 | 0.59 | 0.71 | 0.87 |
+  | of which RPC (in the handler, minus queue wait and inference) | 0.29 | 0.34 | 0.56 | 0.69 |
+  | Queue wait (worker's pop − API's enqueue) | 0.21 | 0.27 | 0.25 | 0.33 |
+
+  - **Overhead is under 2 ms at p99, about 17× below the 30 ms assumed.** The sklearn cross-check
+    agrees: its whole request takes 1.28 ms at p99.
+  - Sentiment overhead is 0.6 ms higher than iris, split about evenly between HTTP and RPC. Its
+    request carries ~250 characters of text against iris's four numbers, so larger bodies and
+    messages to parse, validate and copy are the likely cause; not separated by experiment.
+  - The spread is tight (p99 within 15% of p50 for both models), so one request in flight sees
+    almost no variation from the path itself.
+- **What it changes** (T = p99 batch time at 48 tokens, run I: 38.9 ms at batch 4, 64.5 ms at
+  batch 8; overhead = sentiment p99, 1.77 ms; formula from C1.11):
+
+  | | Overhead assumed (30 ms) | Overhead measured (1.77 ms) |
+  |---|---|---|
+  | Batch 4: m, `max_queue_depth` per worker | 2, 8 | 2, **8 (unchanged)** |
+  | Batch 4: worst case at the queue limit (3T + overhead) | 146.7 ms | **118.5 ms** |
+  | Batch 8: saturated, empty queue (2T + overhead) | 159.0 ms (misses 150) | **130.8 ms (fits)** |
+  | Batch 8: m, `max_queue_depth` per worker | 0 (no queue fits) | 1, 8 |
+
+  - **The queue limit stays 8 per worker** for the transformer; the budget at the limit gains
+    28 ms of margin.
+  - **Batch size 8 now fits on paper.** C1.14 chose 4 because batch 8 missed the target by 9 ms
+    with 30 ms assumed. At 1.77 ms it fits with 19 ms to spare, at the same queue limit and with
+    22% more peak throughput per worker (167 vs 137 items/s, run I). The batch size is **not
+    changed** here: the measured overhead is a lower bound, and 19 ms is the margin that must
+    absorb whatever load adds. C1.14 already plans the end-to-end comparison of 4 and 8 in the
+    load-test stage; open proposal P19 records the question.
+  - The 500 ms timeout (C1.16) is unchanged: its rule (about 3× the worst case an accepted
+    request should take) now has more room, not less.
+- **Evidence:**
+  - `bench/results/stage2-overhead-iris-20261122T092735Z.json`: iris figures
+  - `bench/results/stage2-overhead-sentiment-20261122T093415Z.json`: sentiment figures
+  - `bench/results/stage1-transformer_classifier-20261110T105742Z.json` (run I): T at batch 4 and 8, and the 137 / 167 items/s
 
 ---
 
@@ -1286,7 +1334,7 @@ Not specified before Stage 2; decided while building it.
 | Worker loop | collector thread + compute thread | **one loop, pulls a batch when compute is free** | C1.6, C1.11 |
 | Saturated worst case (empty queue) | not modelled | **2T** | C1.2, C1.11 |
 | Inference threads (M1) | ≤ cores (8) | **4 (performance cores)** | C1.5 |
-| Queue limit | 16 × workers | **`max_queue_depth`: explicit per-version total, set from the benchmark's recommendation (8 per worker for the transformer, provisional until overhead is measured)** | C1.7, C1.11, C1.14, C1.17 |
+| Queue limit | 16 × workers | **`max_queue_depth`: explicit per-version total, set from the benchmark's recommendation (8 per worker for the transformer; unchanged with measured overhead, checked by the load test)** | C1.7, C1.11, C1.14, C1.17 |
 | p99 target | < 150 ms at target load | < 150 ms for inputs ≤ 48 tokens: **at ≤ 70% load, and for accepted requests under overload** | C1.3, C1.12 |
 | Contrast model `max_batch_size` | 1 | 1 (rationale corrected) | C1.8 |
 | Benchmark environment | Docker Compose | **Native macOS (Redis in Docker), open-loop load** | C1.15 |
@@ -1302,7 +1350,7 @@ Not specified before Stage 2; decided while building it.
 | Input size limits | unspecified | **body ≤ 16 KB (413), text ≤ 1,000 characters (422), then truncation to 48 tokens in the worker** | C2.2, C1.13 |
 | Redis URL | plain string | **`SecretStr`** (and the future `cache_redis_url`) | C2.4 |
 | Wire timestamps | integer ms | **fractional ms, wall clock (assumes synchronised clocks across hosts)** | C2.3, C2.5 |
-| Serving overhead | 30 ms assumed | **30 ms assumed; light-load measurement (a lower bound) pending** | C2.6 |
+| Serving overhead | 30 ms assumed | **1.77 ms p99 (sentiment), 1.10 ms (iris), at light load: a lower bound** | C2.6 |
 | Benchmark result files | git-ignored | **committed in `bench/results/`; a test checks every cited file exists; new files record script and git commit** | C1.23 |
 
 ---
@@ -1343,3 +1391,8 @@ The proposals below come from the design audit of 2026-11-10. Risks R1 and R2 ar
   `max_batch_size = 1`. Proposal: try `max_wait_ms = 0` with a larger batch size in the load test.
 - **P17: recorded for deferred stages.** Decided: see C1.22.
 - **P18: `redis_url` as a secret.** Decided: see C2.4.
+- **P19: `max_batch_size` 4 or 8 (C1.14, C2.6; load-test stage).** Raised in Stage 2. With
+  measured overhead, batch 8 fits the budget on paper (130.8 ms saturated, `max_queue_depth` 8 per
+  worker, as for batch 4) and gives 22% more peak throughput per worker. Proposal: keep 4 through
+  Stages 3–6; in the load test, compare 4 and 8 end to end under overload and adopt 8 only if
+  accepted requests still meet 150 ms at p99.

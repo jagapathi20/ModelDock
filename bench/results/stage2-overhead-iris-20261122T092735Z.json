@@ -1,0 +1,77 @@
+{
+  "args": {
+    "url": "http://localhost:8000",
+    "model": "iris",
+    "requests": 1000,
+    "warmup": 50,
+    "words": 46,
+    "seed": 0,
+    "out": null
+  },
+  "machine": {
+    "platform": "macOS-26.1-arm64-arm-64bit",
+    "python": "3.12.11",
+    "cpu_count_logical": 8,
+    "cpu_model": "arm",
+    "inference_threads": null,
+    "torch": "2.15.0",
+    "transformers": "5.22.1",
+    "torch_num_threads": 4
+  },
+  "provenance": {
+    "script": "bench_overhead.py",
+    "git": {
+      "commit": "e680e54f21bff918c2353ff63ed35fef4102a2c1",
+      "dirty": false
+    }
+  },
+  "note": "Light load, one request in flight: a lower bound on overhead. Overhead grows under load; a queue limit derived from this is optimistic until the Stage 7 load test checks it (C2.6).",
+  "results": {
+    "measured_requests": 1000,
+    "errors_by_status": {},
+    "stats_ms": {
+      "e2e_ms": {
+        "p50": 1.0865410004043952,
+        "p90": 1.1643750003713649,
+        "p99": 1.282875000470085,
+        "max": 1.3791250003123423,
+        "mean": 1.0901946389712975
+      },
+      "inference_ms": {
+        "p50": 0.151,
+        "p90": 0.164,
+        "p99": 0.221,
+        "max": 0.301,
+        "mean": 0.154763
+      },
+      "overhead_ms": {
+        "p50": 0.9357080001288559,
+        "p90": 0.9947500002203742,
+        "p99": 1.102875001227949,
+        "max": 1.1566670006436761,
+        "mean": 0.9354316389712976
+      },
+      "http_ms": {
+        "p50": 0.4405000003832392,
+        "p90": 0.4857920011101523,
+        "p99": 0.592458998982911,
+        "max": 0.6894170008520596,
+        "mean": 0.4492266389712975
+      },
+      "rpc_ms": {
+        "p50": 0.28600000000000003,
+        "p90": 0.29799999999999993,
+        "p99": 0.33799999999999997,
+        "max": 0.42600000000000005,
+        "mean": 0.281241
+      },
+      "queue_ms": {
+        "p50": 0.209,
+        "p90": 0.22,
+        "p99": 0.267,
+        "max": 0.427,
+        "mean": 0.204964
+      }
+    }
+  }
+}
