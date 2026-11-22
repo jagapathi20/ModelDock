@@ -9,8 +9,15 @@ build/
 
 .env
 
-# Local model cache (Stage 5) and downloaded weights
+# Model files. Recreated by scripts/fetch_sentiment_model.py and scripts/train_iris.py,
+# and far too large for git (the DistilBERT weights alone are ~260 MB).
+artifacts/
+
+# Local model cache and downloaded weights (model registry, future work)
 .model-cache/
 *.pt
 *.safetensors
 *.joblib
+
+# bench/results/ is deliberately NOT ignored: every performance figure in docs/ cites one of
+# its JSON files, and tests/test_evidence.py fails if a cited file is missing (C1.23).

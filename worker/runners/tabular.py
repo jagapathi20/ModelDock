@@ -1,9 +1,11 @@
 """Runner for scikit-learn classifiers on numeric features (the contrast model).
 
-Inference here costs microseconds to a millisecond, so there's nothing for
-batching to save; this model runs with ``max_batch_size = 1`` (D5). It exists
-to show the runner interface (and later the registry) handles more than one
-kind of model.
+One call costs about 0.12 ms whether it holds 1 item or 32, so batching
+does cut the per-item cost. It stays off (``max_batch_size = 1``) because
+waiting up to ``max_wait`` (15 ms) to fill a batch costs far more than the
+fraction of a millisecond it would save (C1.8; P16 proposes trying
+``max_wait_ms = 0`` with larger batches instead). The model exists to show the
+runner interface handles more than one kind of model.
 
 Artifact layout (written by ``scripts/train_iris.py``)::
 
@@ -39,8 +41,9 @@ class SklearnClassifierRunner(ModelRunner):
 
     def load(self, model_dir: Path) -> None:
         # joblib.load is pickle underneath, and unpickling can run arbitrary
-        # code. Only load artifacts we produced ourselves. Stage 5 adds the
-        # second guard: the file's SHA-256 must match the registry entry.
+        # code. Only load artifacts we produced ourselves. The model registry
+        # (future work, C1.23) would add a second guard: the file's SHA-256
+        # must match the registry entry (D8).
         bundle = joblib.load(Path(model_dir) / ARTIFACT_FILENAME)
         self._pipeline = bundle["pipeline"]
         self._labels = list(bundle["labels"])

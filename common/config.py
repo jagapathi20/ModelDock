@@ -12,7 +12,7 @@ can be configured.
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,21 +32,12 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = Field(default=8000, ge=1, le=65535)
 
-    # --- Redis (request queues, reply lists, cache, rate limits) -----------
+    # --- Redis (request queues, reply lists) ------------------------------
     redis_url: str = "redis://localhost:6379/0"
 
-    # --- Postgres (model registry, clients, API keys) ----------------------
-    # The +asyncpg driver suffix is what SQLAlchemy's async engine needs (Stage 5).
-    postgres_dsn: SecretStr = SecretStr(
-        "postgresql+asyncpg://modeldock:modeldock@localhost:5432/modeldock"
-    )
-
-    # --- Object storage (model weights; MinIO locally, R2/S3 in deployment)
-    s3_endpoint_url: str = "http://localhost:9000"
-    s3_access_key: str = "minioadmin"
-    s3_secret_key: SecretStr = SecretStr("minioadmin")
-    s3_bucket: str = "models"
-    s3_region: str = "us-east-1"
+    # Postgres (postgres_dsn) and object storage (s3_*) settings were removed in Stage 1.5:
+    # the first release runs neither (C1.23). They come back, as SecretStr where they hold
+    # credentials (C0.2), in the stage that uses them: Postgres with S1, S3 with the registry.
 
 
 @lru_cache

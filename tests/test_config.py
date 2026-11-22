@@ -8,8 +8,6 @@ def test_defaults_point_at_local_compose_services():
     s = Settings()
     assert s.env == "dev"
     assert s.redis_url == "redis://localhost:6379/0"
-    assert s.s3_endpoint_url == "http://localhost:9000"
-    assert s.s3_bucket == "models"
 
 
 def test_env_vars_override_defaults(monkeypatch):
@@ -27,11 +25,11 @@ def test_env_var_names_are_case_insensitive(monkeypatch):
 
 def test_dotenv_file_is_read_but_real_env_wins(tmp_path, monkeypatch):
     # conftest already chdir'd into tmp_path, so .env here is the one loaded.
-    (tmp_path / ".env").write_text("MODELDOCK_S3_BUCKET=from-dotenv\nMODELDOCK_ENV=test\n")
+    (tmp_path / ".env").write_text("MODELDOCK_LOG_LEVEL=DEBUG\nMODELDOCK_ENV=test\n")
     monkeypatch.setenv("MODELDOCK_ENV", "prod")
     s = Settings()
-    assert s.s3_bucket == "from-dotenv"
-    assert s.env == "prod"
+    assert s.log_level == "DEBUG"  # only in .env, so .env is read
+    assert s.env == "prod"  # in both, so the real env var wins
 
 
 def test_invalid_values_fail_at_startup(monkeypatch):
@@ -45,11 +43,15 @@ def test_invalid_values_fail_at_startup(monkeypatch):
         Settings()
 
 
-def test_secrets_are_masked_when_printed():
+def test_removed_settings_in_an_old_env_file_are_ignored(tmp_path):
+    # A .env written for Stage 0/1 still sets the Postgres and S3 variables removed in
+    # Stage 1.5. extra="ignore" means they are skipped, so an old .env doesn't break startup.
+    (tmp_path / ".env").write_text(
+        "MODELDOCK_S3_BUCKET=models\nMODELDOCK_POSTGRES_DSN=postgresql://x\n"
+    )
     s = Settings()
-    assert "minioadmin" not in repr(s.s3_secret_key)
-    assert s.s3_secret_key.get_secret_value() == "minioadmin"
-    assert "modeldock:modeldock" not in repr(s)
+    assert not hasattr(s, "s3_bucket")
+    assert not hasattr(s, "postgres_dsn")
 
 
 def test_get_settings_is_cached():

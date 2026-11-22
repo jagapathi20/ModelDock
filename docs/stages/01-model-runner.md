@@ -1,13 +1,22 @@
 # Stage 1: Model runners and batching measurement
 
+> **Updated 2026-11-21.** This doc describes the Stage 1 code, which is unchanged. Its
+> forward-looking statements were brought in line with `docs/DESIGN.md`, mainly the revised
+> build plan (C1.23). Several values chosen after this stage's benchmarks differ from the ones
+> quoted below (batch size, `max_length`, the latency formulas); each place says which entry
+> replaced it. Where this doc and `DESIGN.md` disagree, `DESIGN.md` wins.
+
 ## Context (read this first in a new chat)
 
 **ModelDock** is an ML model inference server built as a **backend systems project**.
 Clients send inputs over HTTP and get predictions back. The interesting parts are the systems
 around the model: a Redis queue between API and worker processes, dynamic batching,
-backpressure, caching, canary rollouts, rate limiting and observability, all measured under load.
+backpressure, timeouts, graceful shutdown and observability, all measured under load. Rate
+limiting and a response cache are stretch stages; a model registry and canary rollouts are
+designed but deferred (C1.23).
 
-Relevant design decisions for this stage (from the design handoff):
+Relevant design decisions for this stage, as they stood before it (now in `docs/DESIGN.md`,
+Part 1):
 
 - **D1:** the main workload is a CPU transformer sentiment classifier
   (`distilbert-base-uncased-finetuned-sst-2-english`), where batching raises throughput a lot
@@ -16,6 +25,8 @@ Relevant design decisions for this stage (from the design handoff):
 - **D3:** API processes never load models. Only **worker processes** do.
 - **D5:** a worker collects requests into a batch until `max_batch_size` (start: 16) is reached
   or `max_wait` (start: 15 ms) has passed since the first request, then runs the batch.
+  *Since changed:* `max_batch_size = 4` (C1.4, C1.14), and the worker is one loop that pulls a
+  batch only when compute is free (C1.11).
 - **D7:** one worker process per model version, PyTorch threads set with
   `torch.set_num_threads(N)` so processes × threads never exceeds the core count.
 - **D10:** the response cache relies on inference being deterministic.
@@ -49,7 +60,13 @@ modeldock/
 └── docs/stages/01-model-runner.md  (this file)
 ```
 
-`artifacts/` (model files) and `bench/results/` (benchmark JSON) are git-ignored.
+**Not quite git-ignored.** `.gitignore` ignores weight files by extension (`*.safetensors`,
+`*.joblib`, `*.pt`), not the `artifacts/` folder, so `artifacts/sentiment-v1/config.json` and the
+tokenizer files were committed without the weights. A fresh clone therefore has an incomplete
+model folder: run `scripts.fetch_sentiment_model` before loading it. Stage 1.5 housekeeping
+should ignore `artifacts/` as a whole and remove those three files from git. `bench/results/` is
+not ignored either: the four Stage 1 result files are committed, as the evidence that
+`DESIGN.md` cites.
 
 ## 1. Dependencies: a `worker` extra, and CPU-only PyTorch
 
@@ -60,7 +77,7 @@ worker = ["torch>=2.15", "transformers>=5.0", "scikit-learn>=1.9", "joblib>=1.6"
 
 These are an **optional extra**, not regular dependencies. `uv sync` installs only what the API
 needs; `uv sync --extra worker` adds the ML libraries. This is D3 showing up in packaging: the
-API process never loads a model, so its install (and its Docker image in Stage 9) doesn't carry
+API process never loads a model, so its install (and its Docker image in Stage 5) doesn't carry
 PyTorch at all. The `worker` package is still importable without the extra. Only the runner
 modules need torch, and `worker/runners/__init__.py` imports them lazily.
 
@@ -101,8 +118,9 @@ implement the `@abstractmethod`s, or instantiating them raises `TypeError`.
 The contract, written in the class docstring:
 
 1. **`load()` reads from a local directory only. It never downloads.** Getting weights onto disk
-   is a separate step: `scripts/fetch_sentiment_model.py` now, the object-storage download with
-   SHA-256 check in Stage 5. Keeping them apart means the runner code is the same whatever the
+   is a separate step: `scripts/fetch_sentiment_model.py` now, and an object-storage download
+   with SHA-256 check if the registry is built (deferred to future work by C1.23). Keeping them
+   apart means the runner code is the same whatever the
    storage backend, and a worker can't silently hit the network at load time.
 2. **`predict_batch()` returns exactly one output per input, in the same order.** The worker will
    match outputs back to requests (and their `request_id`s) by position, so order is part of the
@@ -150,10 +168,12 @@ depends on your CPU, which is what the benchmark measures.
   consequences:
   - Correctness: a text's result must not depend on what else is in its batch. The test
     `test_batched_result_matches_one_at_a_time` checks exactly this.
-  - Cost: one long text makes the whole batch pay for its length. That's why
-    **`max_length = 128`** (DistilBERT allows 512): it caps the worst-case cost of any batch.
-    Longer texts are truncated, keeping the start. This is a new setting that isn't in the
-    locked design; it's configurable, and Stage 3 moves it into config.
+  - Cost: one long text makes the whole batch pay for its length. That's why the runner has
+    a `max_length` (DistilBERT allows 512): it caps the worst-case cost of any batch. Longer
+    texts are truncated, keeping the start. The code's default is 128 (C1.9). *Since changed:*
+    the input-length runs showed 128 tokens misses the latency target, so the value is
+    **48**, and it is part of the model version and immutable, not global config (C1.13).
+    Stage 3 sets it per version.
 - **Labels** come from `model.config.id2label` (`{0: "NEGATIVE", 1: "POSITIVE"}` for SST-2), so
   the runner works for any sequence-classification model, not just this one.
 - **`local_files_only=True`** in `from_pretrained` makes loading fail fast if files are missing,
@@ -188,7 +208,8 @@ will validate inputs before they're queued; see "open questions" for why that ma
 
 **Security note: `joblib.load` is `pickle` underneath, and unpickling can execute arbitrary
 code.** A malicious `.joblib` file is a remote-code-execution vector. Rule: only load artifacts you
-produced. Stage 5 adds the second guard: the file's SHA-256 must match the registry. (Transformer
+produced. The registry would add a second guard, a SHA-256 check against its entry, but it is
+deferred to future work (C1.23). (Transformer
 weights are `.safetensors`, a format designed to be safe to load, which is one reason the HF
 ecosystem moved to it.)
 
@@ -249,8 +270,15 @@ plus overhead.
 
 This isn't a design change by itself. It changes **which number to compare against 150 ms**:
 `3T + overhead`, not `15 + T`. The table above is the formula the script prints, with your
-measured T filled in. Overhead (Redis round trips, JSON, HTTP) isn't measured here; Stage 11 measures
-the full path.
+measured T filled in. Overhead (Redis round trips, JSON, HTTP) isn't measured here; Stage 2
+measures it, and the Stage 7 load tests measure the full path.
+
+> **Superseded.** This table was corrected in `DESIGN.md` (C1.2), then replaced: without the
+> collector thread, the saturated worst case with an empty queue is `2T`, and the general formula
+> is `T × (1 + ceil((d + 1) / B))` with `d` requests ahead (C1.11). The queue limit is an explicit
+> per-version setting (C1.17), not `16 × workers`. The script's printed budget still uses the
+> formulas above; Stage 3 updates it to print the C1.11 budget and the recommended
+> `max_queue_depth`. Until then, ignore that block of its output.
 
 ## 6. Tests
 
@@ -274,13 +302,16 @@ benchmark run is the real-model check.
 
 ## Open questions for later stages (not changed in this stage)
 
+These are now proposals P1, P2 and P3 in `DESIGN.md`, Part 4. P1 and P2 are deferred with the
+registry (C1.23); P3 is part of Stages 2 and 3.
+
 1. **The registry needs to know which runner to use.** The locked schema (`models`,
    `model_versions`) has no field saying "this is a transformer" vs "this is sklearn".
-   Proposal for Stage 5: add `runtime text` to `models`, holding the runner kind
+   Proposal for the registry stage: add `runtime text` to `models`, holding the runner kind
    (`transformer_classifier` / `sklearn_classifier`).
 2. **A transformer artifact is a directory, not one file.** D8's example key
    `models/sentiment/v3-<hash>.pt` assumes a single file, but a saved HF model is several files
-   (`config.json`, `model.safetensors`, tokenizer files). Proposal for Stage 5: upload each version as
+   (`config.json`, `model.safetensors`, tokenizer files). Proposal for the registry stage: upload each version as
    one `.tar` archive, so the immutable key, the SHA-256 and the local cache keyed by hash all still
    work unchanged.
 3. **One bad input shouldn't fail a whole batch.** If one input in a batch of 16 is malformed, the
@@ -295,7 +326,8 @@ uv sync --extra worker                                   # adds torch (CPU), tra
 uv run ruff check . && uv run ruff format --check .
 uv run pytest -v
 
-uv run python -m scripts.fetch_sentiment_model           # -> artifacts/sentiment-v1 (~270 MB)
+uv run python -m scripts.fetch_sentiment_model           # -> artifacts/sentiment-v1 (~270 MB; needed even
+                                                         #    after a clone: weights aren't in git)
 uv run python -m scripts.train_iris                      # -> artifacts/iris-v1
 
 uv run python -m scripts.bench_batching --model-dir artifacts/sentiment-v1
@@ -328,4 +360,6 @@ Changes made after the first run on macOS:
   `==` and failed on macOS (scores differed in the 16th digit, from a different BLAS code path).
   It now checks labels exactly and scores within `1e-9`.
 - `scripts/bench_batching_1.py`: a copy of the benchmark that also reports the Apple Silicon
-  chip and its performance/efficiency core split. Measurement logic is unchanged.
+  chip and its performance/efficiency core split. Measurement logic is unchanged. The original
+  is kept because recorded runs A and S were produced by it, and `DESIGN.md` cites them by
+  script name.

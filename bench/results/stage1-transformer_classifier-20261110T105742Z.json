@@ -1,0 +1,65 @@
+{
+  "args": {
+    "kind": "transformer_classifier",
+    "model_dir": "artifacts/sentiment-v1",
+    "batch_sizes": "4,8",
+    "threads": 4,
+    "words": 46,
+    "warmup": 5,
+    "iters": 1000,
+    "max_batch_size": 16,
+    "max_wait_ms": 15.0,
+    "target_ms": 150.0,
+    "out": null
+  },
+  "machine": {
+    "platform": "macOS-26.1-arm64-arm-64bit",
+    "python": "3.12.11",
+    "cpu_count_logical": 8,
+    "cpu_model": "Apple M1",
+    "inference_threads": 4,
+    "performance_cores": 4,
+    "efficiency_cores": 4,
+    "torch": "2.15.0",
+    "transformers": "5.22.1",
+    "torch_num_threads": 4
+  },
+  "load_seconds": 1.278710458000205,
+  "results": [
+    {
+      "batch_size": 4,
+      "iters": 1000,
+      "batch_ms_p50": 29.154333,
+      "batch_ms_p90": 29.516625,
+      "batch_ms_p99": 38.935792,
+      "batch_ms_mean": 29.620414184,
+      "item_ms_p50": 7.28858325,
+      "items_per_sec": 137.20087508090134,
+      "speedup_per_item_vs_bs1": 1.0,
+      "phases_ms_p50": {
+        "tokenize": 0.480791,
+        "forward": 28.6198535,
+        "postprocess": 0.0514795
+      },
+      "padded_tokens_mean": 48
+    },
+    {
+      "batch_size": 8,
+      "iters": 1000,
+      "batch_ms_p50": 48.045167,
+      "batch_ms_p90": 50.404167,
+      "batch_ms_p99": 64.514667,
+      "batch_ms_mean": 49.1382508,
+      "item_ms_p50": 6.005645875,
+      "items_per_sec": 166.5099842404544,
+      "speedup_per_item_vs_bs1": 1.0,
+      "phases_ms_p50": {
+        "tokenize": 0.859833,
+        "forward": 47.124812000000006,
+        "postprocess": 0.0565625
+      },
+      "padded_tokens_mean": 48
+    }
+  ],
+  "latency_budget": null
+}

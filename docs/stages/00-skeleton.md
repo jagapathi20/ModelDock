@@ -1,22 +1,33 @@
 # Stage 0: Project skeleton (ModelDock)
 
+> **Updated 2026-11-21.** This doc describes the Stage 0 code, which is unchanged. Its
+> forward-looking statements (stage numbers, what later stages add) were brought in line with
+> `docs/DESIGN.md`: the revised build plan (C1.23), worker-only dependencies (C1.10), native
+> benchmarks (C1.15), worker health (C1.21) and the separate cache instance (C1.22, R12).
+> Where this doc and `DESIGN.md` disagree, `DESIGN.md` wins.
+
 ## Context (read this first in a new chat)
 
 This repo is **ModelDock**, an ML model inference server built as a **backend systems project**. Clients send
 inputs over HTTP and get predictions back. The interesting parts are the systems around the
 model: a Redis queue between API and worker processes, dynamic batching, backpressure (503),
-a response cache, canary rollouts across model versions, API keys and rate limiting,
-graceful shutdown, and Prometheus metrics, all measured under load with Locust.
+timeouts (504), graceful shutdown and Prometheus metrics, all measured under open-loop load.
+Rate limiting with API keys and a response cache are stretch stages; a model registry and
+canary rollouts across model versions are designed but deferred (C1.23).
 
-The full design lives in a separate handoff document. The parts that matter for this stage:
+The full design lives in `docs/DESIGN.md`. The parts that matter for this stage:
 
 - **Two process types (design decision D3).** *API processes* (FastAPI) do HTTP, auth,
   routing, caching and backpressure, and never load a model. *Worker processes* load a
   model and run batched inference. They talk only through Redis.
 - **Backing services.** Redis carries request queues, reply lists, the cache and rate-limit
-  buckets. Postgres stores the model registry, clients and API keys. S3-compatible object
-  storage (MinIO locally, Cloudflare R2 in deployment) stores model weights.
-- The build happens in 13 stages. **Stage 0 builds no features.** It sets up the repo
+  buckets. In the original design, Postgres stores the model registry, clients and API keys,
+  and S3-compatible object storage (MinIO locally, Cloudflare R2 in deployment) stores model
+  weights. Stage 0's Compose file runs all three. Under the revised plan (C1.23) models come
+  from config, MinIO and Postgres leave Compose in Stage 1.5, and Postgres returns with
+  stretch stage S1 (rate limiting).
+- The original plan had 13 stages (0 to 12); C1.23 replaced it with core stages 1.5 to 8 plus
+  stretch stages S1 to S3. **Stage 0 builds no features.** It sets up the repo
   layout, dependency management, linting, testing, configuration and the local backing
   services so every later stage has a stable place to land.
 
@@ -30,7 +41,7 @@ modeldock/
 ├── .env.example          every config variable, with local defaults
 ├── .gitignore
 ├── docker-compose.yml    Redis, Postgres, MinIO
-├── README.md             short run instructions (rewritten fully in Stage 12)
+├── README.md             short run instructions (rewritten fully in Stage 8)
 ├── api/
 │   ├── __init__.py
 │   └── main.py           FastAPI app factory + GET /health/live
@@ -75,8 +86,9 @@ Important parts of `pyproject.toml`:
 - `requires-python = ">=3.12,<3.13"` and `.python-version` pin Python 3.12. `uv sync`
   downloads 3.12 if the machine doesn't have it.
 - `dependencies` lists only what Stage 0 imports: FastAPI, Uvicorn, pydantic and
-  pydantic-settings. **Each later stage adds its own dependencies** (redis in Stage 2, torch
-  and transformers in Stage 1, SQLAlchemy in Stage 5, ...). That way every dependency
+  pydantic-settings. **Each later stage adds its own dependencies** (torch, transformers and
+  scikit-learn in Stage 1 as the optional `worker` extra (C1.10), redis in Stage 2, SQLAlchemy
+  with stretch stage S1, ...). That way every dependency
   arrives in the same commit as the code that uses it, and `git log pyproject.toml` tells
   the story of the project.
 - `[dependency-groups] dev` holds tools only needed during development (pytest, ruff, httpx).
@@ -177,8 +189,10 @@ app = create_app()
 - **Liveness** (`/health/live`): is the process running and able to answer HTTP at all? If
   this fails, the right action is to restart the process.
 - **Readiness** (`/health/ready`, added later): can this process do useful work right now?
-  For workers that means the model is downloaded, its SHA-256 verified, and a warm-up batch
-  run. If this fails, the right action is to stop sending it traffic, *not* to restart it.
+  For workers that means the model is loaded, a warm-up batch has run, and the main loop ran
+  within the last 3 s (C1.21; download and SHA-256 checks join it if the registry is built).
+  For the API it means the reply listener ran within the last 3 s (C1.19). If this fails,
+  the right action is to stop sending it traffic, *not* to restart it.
 
 If liveness also checked Redis, a Redis outage would make the orchestrator restart every
 API process in a loop. Restarting doesn't fix Redis; it only adds churn and cold starts.
@@ -206,22 +220,30 @@ trivial handler, running on the loop is cheaper.
 ### 7. Backing services: `docker-compose.yml`
 
 Stage 0 runs only infrastructure in Docker. The API (and later the worker) run on your
-machine with `uv run`, which gives fast reloads while developing. Stage 9 onward adds the
-app containers themselves.
+machine with `uv run`, which gives fast reloads while developing. Stage 5 (containers and
+reliability) adds the app containers themselves (C1.21). Benchmark numbers always come from the
+native setup, not containers (C1.15).
 
 - **Redis 7.4** with persistence turned off (`--appendonly no --save ""`). Everything we keep
   in Redis is ephemeral by design: queued requests have deadlines of a few hundred ms, reply
-  lists belong to live processes, the cache can be rebuilt, and D12 says in-flight requests
+  lists belong to live processes, the cache (later in its own instance) can be rebuilt, and D12 says in-flight requests
   aren't recovered after a crash. Writing it all to disk would cost I/O and buy nothing.
-  (Stage 7 adds `maxmemory` and LRU eviction here.)
-- **Postgres 16** with a named volume `pgdata`, so registry data survives
-  `docker compose down`. `docker compose down -v` deletes the volume and resets it.
-- **MinIO** with a named volume `miniodata`. See the note below about the image.
+  This instance must **never** get an eviction policy: `allkeys-lru` could evict request
+  queues and rate-limit buckets, and `volatile-lru` could evict reply lists, which carry an
+  expiry (C1.18). The response cache (stretch stage S2) gets its own Redis instance with
+  `maxmemory` and LRU eviction instead (C1.22, R12).
+- **Postgres 16** (removed in Stage 1.5, back with stretch stage S1) with a named volume
+  `pgdata`, so its data survives `docker compose down`. `docker compose down -v` deletes the
+  volume and resets it.
+- **MinIO** (removed in Stage 1.5; returns only if the registry is built) with a named volume
+  `miniodata`. See the note below about the image.
 - **Healthchecks** on Redis (`redis-cli ping`) and Postgres (`pg_isready`). `docker compose ps`
   shows `healthy` once they're actually accepting connections, not merely started. Later,
   app containers will use `depends_on: condition: service_healthy` so they don't start
   before their dependencies are ready.
-- **`restart: unless-stopped`** is the restart policy from D12, applied from the start.
+- **`restart: unless-stopped`** is the restart policy from D12, applied from the start. It
+  restarts a container only when its process exits; plain Docker does not restart a container
+  that is merely unhealthy (C1.21).
 
 **Note: the MinIO image.** The official `minio/minio` Docker image stopped being published
 in October 2025, when MinIO moved its community edition to source-only distribution. This
@@ -232,7 +254,8 @@ consequences:
 - The image is minimal (no shell, no `curl`), so it has no in-container healthcheck. Check it
   from the host with `curl localhost:9000/minio/health/live`.
 - The MinIO web console isn't included (it was removed from the community edition). Bucket
-  creation and uploads happen from code with boto3 in Stage 5.
+  creation and uploads would happen from code with boto3 in the registry stage, which C1.23
+  defers to future work.
 
 ## How this connects to later stages
 
@@ -240,7 +263,9 @@ consequences:
   settings in Stage 3, the backpressure threshold in Stage 4.
 - `create_app()` gains a lifespan (Redis pool, reply listener) in Stage 2.
 - `worker/` gets the model runner in Stage 1 and its main loop in Stage 2.
-- The Compose file gains the app containers, Prometheus, Grafana and Locust.
+- The Compose file loses MinIO and Postgres in Stage 1.5, gains the app containers in Stage 5
+  and Prometheus in Stage 6. Grafana is stretch stage S3; the load generator (C1.15 prefers a
+  fixed-arrival-rate tool such as k6) runs natively in Stage 7.
 
 ## Commands
 

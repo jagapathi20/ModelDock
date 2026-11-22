@@ -6,6 +6,8 @@ about a second. Its predictions are meaningless; what's tested is the
 runner's behavior: shape, order, determinism, padding, truncation.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -67,6 +69,61 @@ def test_one_output_per_input_with_valid_labels(runner):
         assert o["label"] in {"NEGATIVE", "POSITIVE"}
         # With two classes the winning probability is always >= 0.5.
         assert 0.5 <= o["score"] <= 1.0
+
+
+# Different token counts on purpose: [CLS] + words + [SEP] = 3, 4, 6 and 7 tokens.
+ORDER_TEXTS = [
+    {"text": "good"},
+    {"text": "great plot"},
+    {"text": "the movie was awful"},
+    {"text": "not very fun and slow"},
+]
+
+
+class _LengthModel:
+    """Stand-in for the network: logits ``[0, n]``, where n is the row's number of real tokens.
+
+    So each input's score is known in advance (softmax of ``[0, n]`` picks label 1 with
+    probability sigmoid(n)) and differs between inputs of different lengths.
+    """
+
+    def __call__(self, input_ids, attention_mask, **_):
+        n = attention_mask.sum(dim=1).float()
+        return SimpleNamespace(logits=torch.stack([torch.zeros_like(n), n], dim=1))
+
+
+def test_output_order_matches_input_order(runner, monkeypatch):
+    """Output i belongs to input i (base.py's contract; the worker relies on it).
+
+    The worker matches outputs to requests, and so to request_ids, by position. If the runner
+    reordered them, every client in the batch would get someone else's answer, and nothing else
+    would fail.
+
+    The tiny random model can't be used to tell inputs apart: its scores for these texts are all
+    about 0.5075, within 3e-6 of each other. So the network is replaced by _LengthModel, whose
+    output for each input is known exactly. The runner's own code (tokenizer, padding,
+    forward(), postprocess()) still runs: a reordering bug there is what this test catches. A
+    real network can't reorder rows; runner code (e.g. sorting by length, future token-budget
+    batching) can.
+    """
+    monkeypatch.setattr(runner, "_model", _LengthModel())
+
+    def expected_score(item):
+        n = len(runner._tokenizer(item["text"])["input_ids"])
+        return torch.sigmoid(torch.tensor(float(n))).item()
+
+    expected = [expected_score(t) for t in ORDER_TEXTS]
+    # Guard: distinct lengths give distinct expected scores, so any swap is visible.
+    assert len({round(e, 6) for e in expected}) == len(ORDER_TEXTS)
+
+    perm = [2, 0, 3, 1]
+    for order in (range(len(ORDER_TEXTS)), perm):
+        batch = [ORDER_TEXTS[i] for i in order]
+        outputs = runner.predict_batch(batch)
+        assert [o["score"] for o in outputs] == pytest.approx(
+            [expected[i] for i in order], abs=1e-6
+        )
+        assert all(o["label"] == "POSITIVE" for o in outputs)  # label 1 always wins: n > 0
 
 
 def test_empty_batch_returns_empty_list(runner):

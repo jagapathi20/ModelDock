@@ -30,6 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from scripts.provenance import provenance
 from worker.runners import RUNNER_KINDS, ModelRunner, build_runner
 
 # Neutral words plus a few sentiment-bearing ones. Random sentences are
@@ -162,11 +163,18 @@ def latency_budget(
                    fill, then the batch runs:              max_wait + T
     - saturated:   a full batch is already running (compute thread busy); the
                    request's batch fills instantly, waits for it, then runs: 2T
-    - at the backpressure threshold (D6: 16 x workers queued = one full batch
-                   ahead per worker) the request also waits for that batch: 3T
+    - at the backpressure threshold (D6's original limit of one full batch
+                   queued per worker) the request also waits for that batch: 3T
 
-    Excludes Redis round trips, JSON, HTTP and the event loop; those come from
-    the Stage 11 load tests.
+    OUTDATED: this is the Stage 1 model, kept unchanged so the "latency_budget"
+    block in existing result files can still be reproduced. It was corrected by
+    C1.2 and then C1.11 (one worker loop, worst case T x (1 + ceil((d + 1) / B))),
+    and the fixed queue limit was replaced by an explicit per-version
+    max_queue_depth (C1.17). Stage 3 replaces this function. Until then, ignore
+    its output and use the budgets in docs/DESIGN.md.
+
+    Excludes Redis round trips, JSON, HTTP and the event loop; Stage 2 measures
+    that overhead, and the Stage 7 load tests measure end-to-end latency.
     """
     full = next((r for r in results if r.batch_size == max_batch_size), None)
     if full is None:
@@ -297,6 +305,7 @@ def main() -> None:
     load_s = time.perf_counter() - t0
 
     info = machine_info(threads)
+    prov = provenance("bench_batching.py")
     print(f"{args.kind} from {args.model_dir} (loaded in {load_s:.2f} s)")
     print(f"{info['cpu_model']}, {info['cpu_count_logical']} logical cores, threads={threads}")
     if args.kind == "transformer_classifier":
@@ -316,6 +325,7 @@ def main() -> None:
             {
                 "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                 "machine": info,
+                "provenance": prov,
                 "load_seconds": load_s,
                 "results": [asdict(r) for r in results],
                 "latency_budget": budget,
@@ -324,6 +334,11 @@ def main() -> None:
         )
     )
     print(f"\nwrote {out}")
+    git = prov["git"]
+    if git is None:
+        print("warning: git commit not recorded (no git, or not a repository)")
+    elif git["dirty"]:
+        print("warning: uncommitted changes; this result is not traceable to a commit")
 
 
 if __name__ == "__main__":

@@ -1,10 +1,21 @@
 # ModelDock
 
-A production-style ML inference server built as a backend systems project:
-dynamic batching, RPC over Redis queues, backpressure, response caching,
-canary rollouts, rate limiting and stage-level observability, measured under load.
+An ML inference server built as a backend systems project. The model is the workload; the
+subject is the system around it, measured under load.
 
-Work in progress. The build is staged; each stage is explained in `docs/stages/`.
+**Work in progress.** The build is staged; each stage is explained in `docs/stages/`.
+This README lists only what is built. The scope of the first release is in
+[`docs/DESIGN.md`](docs/DESIGN.md), C1.23.
+
+**Built so far**
+
+- Model runners behind one interface (`load()`, `predict_batch()`): a DistilBERT sentiment
+  classifier (the main workload) and a scikit-learn iris classifier (the contrast case).
+- A batching benchmark, with every result file committed in `bench/results/` and a test that
+  fails if a doc cites a result that isn't there.
+
+**Next, in order:** RPC over Redis queues with timeouts (504), dynamic batching, backpressure
+(503), containers and graceful shutdown, Prometheus metrics, open-loop load tests.
 
 **Design:** [`docs/DESIGN.md`](docs/DESIGN.md) holds the initial design and a log of every change
 made to it during the build, with the reason and evidence for each.
@@ -13,7 +24,7 @@ made to it during the build, with the reason and evidence for each.
 
 ```bash
 uv sync                     # create .venv and install deps
-docker compose up -d        # Redis, Postgres, MinIO
+docker compose up -d        # Redis
 uv run uvicorn api.main:app --reload
 curl localhost:8000/health/live
 ```
@@ -22,7 +33,7 @@ curl localhost:8000/health/live
 
 ```bash
 uv sync --extra worker                          # torch (CPU), transformers, scikit-learn
-uv run python -m scripts.fetch_sentiment_model  # -> artifacts/sentiment-v1
+uv run python -m scripts.fetch_sentiment_model  # -> artifacts/sentiment-v1 (pinned Hub commit)
 uv run python -m scripts.train_iris             # -> artifacts/iris-v1
 uv run python -m scripts.bench_batching --model-dir artifacts/sentiment-v1
 ```

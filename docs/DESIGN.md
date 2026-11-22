@@ -143,7 +143,8 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - Workers **verify the SHA-256** after download against the value in Postgres.
 - The upload endpoint **stores the file first, then inserts the metadata row**, so a version never points at a missing file.
 
-> **Changed later:** C0.1 (local MinIO image); open proposal P2. See [Part 2](#part-2-design-change-log).
+> **Changed later:** C0.1 (local MinIO image); open proposal P2; C1.23 (deferred to future
+> work; MinIO removed from Compose). See [Part 2](#part-2-design-change-log).
 
 ### D9: Versioned rollout (canary)
 - **One Redis queue per model version**: `q:{model}:{version}`. Each worker pool serves exactly one version and pulls from its queue.
@@ -226,7 +227,7 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - **Managed backing services:** Neon (Postgres), Upstash (Redis, TLS `rediss://`), Cloudflare R2 (objects). **Verify** that the Redis provider supports what we use (Lua `EVAL`, blocking pops, pub/sub), and estimate Redis commands per request against its free quota.
 - The demo shows **functionality**, not performance.
 
-> **Changed later:** C0.1 (local MinIO image), C1.15 (benchmarks run natively), C1.22 (measure memory before the 512 MB demo). See [Part 2](#part-2-design-change-log).
+> **Changed later:** C0.1 (local MinIO image), C1.15 (benchmarks run natively), C1.22 (measure memory before the 512 MB demo), C1.23 (Compose runs Redis only in the first release; the live demo is future work). See [Part 2](#part-2-design-change-log).
 
 ---
 
@@ -268,7 +269,8 @@ api_keys
 
 Use migrations (Alembic).
 
-> **Changed later:** C1.7 (`model_versions.max_queue_depth`); open proposal P1. See [Part 2](#part-2-design-change-log).
+> **Changed later:** C1.7 (`model_versions.max_queue_depth`); open proposal P1; C1.23 (no
+> Postgres in the first-release core; `clients` and `api_keys` return with stretch stage S1). See [Part 2](#part-2-design-change-log).
 
 ---
 
@@ -324,7 +326,8 @@ Use migrations (Alembic).
 - Locust for load testing.
 - Docker + Docker Compose.
 
-> **Changed later:** C0.2, C1.10. See [Part 2](#part-2-design-change-log).
+> **Changed later:** C0.2, C1.10, C1.23 (SQLAlchemy/asyncpg/Alembic arrive with S1, boto3 with
+> the registry). See [Part 2](#part-2-design-change-log).
 
 ---
 
@@ -1091,6 +1094,12 @@ If a core stage overruns, drop the `max_wait` sweep from Stage 7 before dropping
 - An adaptive, latency-based queue limit (C1.17).
 
 - **Evidence:** scope judgment from the design audit, accepted 2026-11-20; no benchmark run.
+- **Implemented in:** Stage 1.5 ([`stages/01.5-housekeeping.md`](stages/01.5-housekeeping.md)).
+  Compose runs Redis only. The `postgres_dsn` and `s3_*` settings are removed too, since nothing
+  reads them; each returns with the stage that uses it (S1, the registry), as `SecretStr` where it
+  holds a credential (C0.2). `bench/results/` is committed, and `tests/test_evidence.py` fails
+  if any doc cites a result file that is not in the repo (rule 3); new result files also record
+  the script and git commit that produced them. `artifacts/` is git-ignored.
 
 ---
 
@@ -1115,7 +1124,8 @@ If a core stage overruns, drop the `max_wait` sweep from Stage 7 before dropping
 | API processes | multiple per port | **one per instance, each scraped separately** | C1.20 |
 | Scope | 13 stages, all built | **7 core stages + housekeeping; 3 stretch; registry, canary and demo deferred** | C1.23 |
 | Worker health endpoints | `/health/ready` with no server to host it | **HTTP thread in the worker: `/metrics`, `/health/live`, `/health/ready`** | C1.21 |
-| Local object storage | MinIO | MinIO (Chainguard build) | C0.1 |
+| Backing services in Compose | Redis, Postgres, MinIO | **Redis only**; Postgres returns with S1, MinIO (Chainguard build) with the registry | C0.1, C1.23 |
+| Benchmark result files | git-ignored | **committed in `bench/results/`; a test checks every cited file exists; new files record script and git commit** | C1.23 |
 
 ---
 
@@ -1161,3 +1171,8 @@ The proposals below come from the design audit of 2026-11-10. Risks R1 and R2 ar
 - **P16: sklearn batching (C1.8).** C1.8's reason argues for `max_wait_ms = 0`, not for
   `max_batch_size = 1`. Proposal: try `max_wait_ms = 0` with a larger batch size in the load test.
 - **P17: recorded for deferred stages.** Decided: see C1.22.
+- **P18: `redis_url` as a secret (C0.2; Stage 2).** Raised in Stage 1.5. Locally the URL has no
+  password, but a managed Redis URL does (`rediss://default:<password>@host:port`), and
+  `redis_url` is a plain `str`, so logging the settings would print it. C0.2 says credentials are
+  `SecretStr`. Proposal: make `redis_url` a `SecretStr` in Stage 2, where the Redis client is
+  first created, and unwrap it only at that call.

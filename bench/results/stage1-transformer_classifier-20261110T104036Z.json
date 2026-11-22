@@ -1,0 +1,148 @@
+{
+  "args": {
+    "kind": "transformer_classifier",
+    "model_dir": "artifacts/sentiment-v1",
+    "batch_sizes": "1,2,4,8,16,32",
+    "threads": 4,
+    "words": 62,
+    "warmup": 5,
+    "iters": 300,
+    "max_batch_size": 16,
+    "max_wait_ms": 15.0,
+    "target_ms": 150.0,
+    "out": null
+  },
+  "machine": {
+    "platform": "macOS-26.1-arm64-arm-64bit",
+    "python": "3.12.11",
+    "cpu_count_logical": 8,
+    "cpu_model": "Apple M1",
+    "inference_threads": 4,
+    "performance_cores": 4,
+    "efficiency_cores": 4,
+    "torch": "2.15.0",
+    "transformers": "5.22.1",
+    "torch_num_threads": 4
+  },
+  "load_seconds": 1.283954791000724,
+  "results": [
+    {
+      "batch_size": 1,
+      "iters": 300,
+      "batch_ms_p50": 16.850583,
+      "batch_ms_p90": 17.250125,
+      "batch_ms_p99": 20.411208,
+      "batch_ms_mean": 17.030784276666665,
+      "item_ms_p50": 16.850583,
+      "items_per_sec": 59.34512770270323,
+      "speedup_per_item_vs_bs1": 1.0,
+      "phases_ms_p50": {
+        "tokenize": 0.229917,
+        "forward": 16.5934375,
+        "postprocess": 0.023104
+      },
+      "padded_tokens_mean": 64
+    },
+    {
+      "batch_size": 2,
+      "iters": 300,
+      "batch_ms_p50": 23.229208,
+      "batch_ms_p90": 23.420042,
+      "batch_ms_p99": 25.760084,
+      "batch_ms_mean": 23.308135826666668,
+      "item_ms_p50": 11.614604,
+      "items_per_sec": 86.09850150724036,
+      "speedup_per_item_vs_bs1": 1.450809945823379,
+      "phases_ms_p50": {
+        "tokenize": 0.34710399999999997,
+        "forward": 22.835417,
+        "postprocess": 0.0523125
+      },
+      "padded_tokens_mean": 64
+    },
+    {
+      "batch_size": 4,
+      "iters": 300,
+      "batch_ms_p50": 37.4742705,
+      "batch_ms_p90": 43.936583,
+      "batch_ms_p99": 69.618042,
+      "batch_ms_mean": 39.439503179999996,
+      "item_ms_p50": 9.368567625,
+      "items_per_sec": 106.7399030489466,
+      "speedup_per_item_vs_bs1": 1.798629595738228,
+      "phases_ms_p50": {
+        "tokenize": 0.6165415000000001,
+        "forward": 36.788729000000004,
+        "postprocess": 0.0581875
+      },
+      "padded_tokens_mean": 64
+    },
+    {
+      "batch_size": 8,
+      "iters": 300,
+      "batch_ms_p50": 61.949167,
+      "batch_ms_p90": 66.444333,
+      "batch_ms_p99": 75.954375,
+      "batch_ms_mean": 63.382890413333335,
+      "item_ms_p50": 7.743645875,
+      "items_per_sec": 129.13813675654427,
+      "speedup_per_item_vs_bs1": 2.1760528918815,
+      "phases_ms_p50": {
+        "tokenize": 1.088729,
+        "forward": 60.77995799999999,
+        "postprocess": 0.0592915
+      },
+      "padded_tokens_mean": 64
+    },
+    {
+      "batch_size": 16,
+      "iters": 300,
+      "batch_ms_p50": 117.520271,
+      "batch_ms_p90": 129.036042,
+      "batch_ms_p99": 191.490375,
+      "batch_ms_mean": 121.87938140666668,
+      "item_ms_p50": 7.3450169375,
+      "items_per_sec": 136.14672484885608,
+      "speedup_per_item_vs_bs1": 2.294151687243812,
+      "phases_ms_p50": {
+        "tokenize": 2.035708,
+        "forward": 115.433312,
+        "postprocess": 0.071125
+      },
+      "padded_tokens_mean": 64
+    },
+    {
+      "batch_size": 32,
+      "iters": 300,
+      "batch_ms_p50": 233.128667,
+      "batch_ms_p90": 253.838833,
+      "batch_ms_p99": 291.158083,
+      "batch_ms_mean": 238.76231695333337,
+      "item_ms_p50": 7.28527084375,
+      "items_per_sec": 137.263256431694,
+      "speedup_per_item_vs_bs1": 2.312965895352544,
+      "phases_ms_p50": {
+        "tokenize": 3.9303540000000003,
+        "forward": 228.972708,
+        "postprocess": 0.08031250000000001
+      },
+      "padded_tokens_mean": 64
+    }
+  ],
+  "latency_budget": {
+    "max_batch_size": 16,
+    "max_wait_ms": 15.0,
+    "full_batch_ms_p99": 191.490375,
+    "target_p99_ms": 150.0,
+    "worst_case_ms": {
+      "light_load": 206.490375,
+      "saturated": 382.98075,
+      "at_backpressure_threshold": 574.471125
+    },
+    "within_target": {
+      "light_load": false,
+      "saturated": false,
+      "at_backpressure_threshold": false
+    }
+  }
+}

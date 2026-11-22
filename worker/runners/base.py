@@ -8,7 +8,7 @@ pipeline, ...) behind the same two calls, so the worker's batching loop
     runner.predict_batch(inputs)        # many times, one call per batch
 
 Inputs and outputs are plain JSON-compatible dicts, matching the wire format
-of request and reply messages (handoff section 6): an input is the
+of request and reply messages (docs/DESIGN.md, section 6): an input is the
 ``"input"`` field of a request message, an output becomes the ``"output"``
 field of the reply.
 """
@@ -30,8 +30,9 @@ class ModelRunner(ABC):
 
     Contract:
     - ``load()`` reads from a **local directory only**. It never downloads
-      anything. Fetching weights (from Hugging Face now, from object storage in
-      Stage 5) is a separate step, so the hot path has no network surprises
+      anything. Fetching weights (from Hugging Face now, from object storage
+      if the model registry is built; future work, C1.23) is a separate step,
+      so the hot path has no network surprises
       and the same code serves every storage backend.
     - ``predict_batch(inputs)`` returns exactly one output per input, **in the
       same order**. The worker matches outputs back to requests by position.

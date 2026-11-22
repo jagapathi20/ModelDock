@@ -26,6 +26,7 @@ from worker.runners.base import JsonDict, ModelRunner
 # padded to its *longest* input, so one 512-token input would make every other
 # request in its batch pay for 512 tokens. Capping bounds the worst-case batch
 # cost. Inputs longer than this are truncated (the start of the text is kept).
+# Stage 3 replaces this default with a per-version setting of 48 (C1.13).
 DEFAULT_MAX_LENGTH = 128
 
 
