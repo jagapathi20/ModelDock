@@ -14,7 +14,11 @@ This README lists only what is built. The scope of the first release is in
 - A batching benchmark, with every result file committed in `bench/results/` and a test that
   fails if a doc cites a result that isn't there.
 
-**Next, in order:** RPC over Redis queues with timeouts (504), dynamic batching, backpressure
+- A synchronous predict endpoint over Redis queues: per-model input validation (422), a body
+  size limit (413), a 500 ms timeout (504), and a reply listener that recovers from Redis
+  outages by itself.
+
+**Next, in order:** dynamic batching, backpressure
 (503), containers and graceful shutdown, Prometheus metrics, open-loop load tests.
 
 **Design:** [`docs/DESIGN.md`](docs/DESIGN.md) holds the initial design and a log of every change
@@ -23,11 +27,18 @@ made to it during the build, with the reason and evidence for each.
 ## Run locally
 
 ```bash
-uv sync                     # create .venv and install deps
+uv sync --extra worker      # create .venv; the worker extra adds torch, transformers, sklearn
 docker compose up -d        # Redis
-uv run uvicorn api.main:app --reload
-curl localhost:8000/health/live
+uv run python -m scripts.train_iris                  # -> artifacts/iris-v1 (milliseconds)
+uv run python -m worker --model iris                 # terminal 1: one worker for iris v1
+uv run uvicorn api.main:app --port 8000              # terminal 2: one API process
+curl localhost:8000/health/ready                     # {"status":"ready"}
+curl -X POST localhost:8000/v1/models/iris/predict \
+     -H 'content-type: application/json' -d '{"features": [5.1, 3.5, 1.4, 0.2]}'
 ```
+
+For the sentiment model, fetch it first (below), then run `uv run python -m worker` (the default
+model) and send `{"text": "a great film"}` to `/v1/models/sentiment/predict`.
 
 ## Models and batching benchmark
 

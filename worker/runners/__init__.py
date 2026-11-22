@@ -5,7 +5,7 @@ package doesn't import them eagerly. ``build_runner`` imports only the one
 that's asked for, which keeps ``import worker.runners`` cheap.
 """
 
-from worker.runners.base import JsonDict, ModelNotLoadedError, ModelRunner
+from worker.runners.base import InvalidInputError, JsonDict, ModelNotLoadedError, ModelRunner
 
 RUNNER_KINDS = ("transformer_classifier", "sklearn_classifier")
 
@@ -23,4 +23,11 @@ def build_runner(kind: str) -> ModelRunner:
     raise ValueError(f"unknown runner kind {kind!r}; expected one of {RUNNER_KINDS}")
 
 
-__all__ = ["JsonDict", "ModelNotLoadedError", "ModelRunner", "RUNNER_KINDS", "build_runner"]
+__all__ = [
+    "InvalidInputError",
+    "JsonDict",
+    "ModelNotLoadedError",
+    "ModelRunner",
+    "RUNNER_KINDS",
+    "build_runner",
+]

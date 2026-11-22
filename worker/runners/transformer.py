@@ -20,7 +20,7 @@ from typing import Any
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from worker.runners.base import JsonDict, ModelRunner
+from worker.runners.base import InvalidInputError, JsonDict, ModelRunner
 
 # DistilBERT accepts up to 512 tokens. We cap lower on purpose: a batch is
 # padded to its *longest* input, so one 512-token input would make every other
@@ -86,7 +86,12 @@ class TransformerClassifierRunner(ModelRunner):
     # --- the three phases -------------------------------------------------
 
     def preprocess(self, inputs: Sequence[Mapping[str, Any]]) -> dict[str, torch.Tensor]:
-        texts = [item["text"] for item in inputs]
+        texts = []
+        for i, item in enumerate(inputs):
+            text = item.get("text") if isinstance(item, Mapping) else None
+            if not isinstance(text, str) or not text:
+                raise InvalidInputError(f"input {i}: 'text' must be a non-empty string", index=i)
+            texts.append(text)
         return self._tokenizer(
             texts,
             padding=True,  # pad to the longest text in *this* batch

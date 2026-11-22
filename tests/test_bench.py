@@ -78,3 +78,11 @@ def test_latency_budget_needs_the_configured_batch_size():
     assert (
         latency_budget([_result(8, 10.0)], max_batch_size=16, max_wait_ms=15, target_ms=150) is None
     )
+
+
+def test_server_timing_parsing():
+    from scripts.bench_overhead import parse_server_timing
+
+    header = "app;dur=2.500, queue;dur=0.250, inference;dur=1.000"
+    assert parse_server_timing(header) == {"app": 2.5, "queue": 0.25, "inference": 1.0}
+    assert parse_server_timing("cache;desc=hit") == {}  # entries without dur are skipped

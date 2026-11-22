@@ -3,7 +3,7 @@ import pytest
 pytest.importorskip("sklearn")
 
 from scripts.train_iris import train  # noqa: E402
-from worker.runners import ModelNotLoadedError, build_runner  # noqa: E402
+from worker.runners import InvalidInputError, ModelNotLoadedError, build_runner  # noqa: E402
 from worker.runners.tabular import SklearnClassifierRunner  # noqa: E402
 
 SETOSA = {"features": [5.1, 3.5, 1.4, 0.2]}  # first row of the iris dataset
@@ -52,8 +52,28 @@ def test_batched_result_matches_one_at_a_time(runner):
 
 
 def test_wrong_feature_count_raises(runner):
-    with pytest.raises(ValueError, match="expected 4 features"):
-        runner.predict_batch([{"features": [1.0, 2.0]}])
+    with pytest.raises(InvalidInputError, match="expected 4 features") as exc:
+        runner.predict_batch([SETOSA, {"features": [1.0, 2.0]}])
+    assert exc.value.index == 1  # names the bad input, so Stage 3 can fail only that request
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"features": ["a", 1.0, 2.0, 3.0]},  # not a number
+        {"features": [float("nan"), 1.0, 2.0, 3.0]},  # not finite
+        {"wrong_key": [1.0, 2.0, 3.0, 4.0]},  # missing field
+        "not a dict",
+    ],
+)
+def test_rejected_inputs_raise_invalid_input_error(runner, bad):
+    with pytest.raises(InvalidInputError):
+        runner.predict_batch([bad])
+
+
+def test_invalid_input_error_is_a_value_error():
+    # Old callers that catch ValueError keep working; the worker catches the subclass first.
+    assert issubclass(InvalidInputError, ValueError)
 
 
 def test_empty_batch(runner):

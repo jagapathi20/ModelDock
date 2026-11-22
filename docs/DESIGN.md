@@ -68,7 +68,8 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 6. Enqueue with `request_id`, `reply_to`, and `deadline`.
 7. Await the result future. On timeout, return 504.
 
-> **Changed later:** C1.11 (no collector thread; the worker runs one loop). See [Part 2](#part-2-design-change-log).
+> **Changed later:** C1.11 (no collector thread; the worker runs one loop), C2.1 (input validated
+> against the catalog before enqueue), C2.2 (body size limit before everything). See [Part 2](#part-2-design-change-log).
 
 ---
 
@@ -86,6 +87,9 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - Total time is ~100 ms, well within normal HTTP. An async job API would add a job store and polling round trips and make latency worse.
 - Async fits work taking seconds to minutes, or work that must outlive the client connection. An async bulk-jobs endpoint is **out of scope**.
 - Internally, requests still go through a queue for batching. The client never sees that.
+
+> **Changed later:** C2.5 (the HTTP contract: request and response bodies, error shape, status
+> codes, headers). See [Part 2](#part-2-design-change-log).
 
 ### D3: Separate API and worker processes
 - **API processes** do HTTP, validation, auth, routing, caching, and backpressure only. They **never load models**.
@@ -121,7 +125,7 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - 503 means "the server is overloaded." 429 is reserved for per-client rate limiting (D11).
 - Documented client behavior: **exponential backoff with jitter** on 503, to avoid retry storms. The load-test client implements it.
 
-> **Changed later:** C1.7 (queue limit derived from the budget, per version), C1.11 (formula), C1.14 (value), C1.16 (timeout value), C1.17 (explicit setting, no computed default). See [Part 2](#part-2-design-change-log).
+> **Changed later:** C1.7 (queue limit derived from the budget, per version), C1.11 (formula), C1.14 (value), C1.16 (timeout value), C1.17 (explicit setting, no computed default), C2.3 (deadline checks; wall-clock timestamps), C2.5 (503 also when the queue is unreachable). See [Part 2](#part-2-design-change-log).
 
 ### D7: CPU usage inside a worker
 - Default: **one worker process per model version, one batch at a time**, with PyTorch's internal threads set explicitly via `torch.set_num_threads(N)` so total threads never exceed cores.
@@ -311,6 +315,9 @@ Use migrations (Alembic).
   "timings": { "queue_wait_ms": 4, "batch_wait_ms": 9, "inference_ms": 52, "batch_size": 14 }
 }
 ```
+
+> **Changed later:** C2.1 (`error` is an object with a code), C2.5 (timestamps are fractional
+> milliseconds; `reply_to` restricted to `replies:<32 hex>`). See [Part 2](#part-2-design-change-log).
 
 ---
 
@@ -1101,6 +1108,172 @@ If a core stage overruns, drop the `max_wait` sweep from Stage 7 before dropping
   if any doc cites a result file that is not in the repo (rule 3); new result files also record
   the script and git commit that produced them. `artifacts/` is git-ignored.
 
+## Stage 2: queue round trip
+
+Sources: the Stage 2 proposals (P3, P8, P9, P18), decided 2026-11-22, and gaps found while
+building the endpoint. Details in [`stages/02-queue-round-trip.md`](stages/02-queue-round-trip.md).
+
+### C2.1: Inputs validated per model version; error codes; a failed batch fails only its own requests (D3, section 6; resolves P3)
+
+- **Before (P3):** one malformed input in a batch fails the whole batch; proposal: validate in the
+  API against a per-model schema, reply to a failed batch with an error rather than letting it
+  time out. Section 6's reply had `"error": null` or, implicitly, a string.
+- **What broke:**
+  - The API never loads a model (D3), so it can't ask the model what a valid input is. The sklearn
+    feature count exists only inside `model.joblib`.
+  - "Invalid input" can't be recognised from an exception's type alone: numpy and torch raise
+    plain `ValueError` for their own internal reasons. Mapping every `ValueError` to 422 would tell
+    a client "your request is wrong, don't retry" for a failure that was ours.
+  - Replying to a failed batch with one error for every request makes one bad input fail the
+    requests batched with it, which is the problem P3 set out to fix.
+- **After:**
+  - **A model catalog in code** (`common/models.py`): per version, the runner kind, the artifact
+    directory and the input limits (`max_chars` for text, `n_features` for features). Structured,
+    and it changes only with code or artifacts; deployment knobs stay in environment variables. Part
+    of the version, so immutable like the weights (C1.13).
+  - **The API validates before enqueueing**, with a pydantic schema built from the version's
+    limits: strict types (no `"5.1"` → 5.1, no booleans as numbers), finite numbers (Python's JSON
+    parser accepts `NaN`), no unknown fields. Invalid input gets **422** and is never queued.
+  - **Drift check:** the worker compares the catalog's `n_features` with the loaded artifact at
+    startup and refuses to start if they differ.
+  - **`InvalidInputError`** (`worker/runners/base.py`): runners raise it, after checking the input
+    themselves, for input they reject. It subclasses `ValueError` and carries the index of the bad
+    input in the batch. **Only it** maps to `invalid_input` / 422. Every other exception, including
+    a plain `ValueError` from numpy or torch, is `inference_failed` / 500, with a generic message to
+    the client and the traceback in the worker's log.
+  - **Reply `error` is an object:** `{"code": "invalid_input" | "inference_failed", "message"}`.
+  - **The worker keeps running** after any per-request failure.
+  - **Stage 3 rule for a failed batch:** validate each input before forming the batch; if the batch
+    still fails, re-run each request alone (checking its deadline first) and reply to each with its
+    own result. A request gets 500 only if it fails on its own as well, so if every request fails
+    alone, all get 500.
+- **Why:** 422 and 500 tell the client different things (fix the request vs retry), so the code
+    must say whose fault it was. Validating in the API stops bad input before it can share a batch.
+    The catalog is the only place both processes can read limits from without the API loading a
+    model.
+- **Evidence:** reasoning; behaviour pinned by `tests/test_models.py`, `tests/test_worker.py`,
+  `tests/test_api_predict.py`, and the runner tests. No benchmark run.
+
+### C2.2: Two input-size limits: body bytes (413) and characters (422) (section 3, C1.13; resolves P8)
+
+- **Before (P8):** about 250 characters as a proxy for 48 tokens, reject (413) or truncate, to be
+  decided.
+- **What broke:**
+  - 250 characters would reject texts the worker handles fine: longer inputs are truncated to
+    48 tokens by the tokenizer (C1.13), which is the limit that bounds compute.
+  - A field limit doesn't bound request size or JSON parsing: FastAPI reads and parses the whole
+    body before any field is checked.
+- **After:** two limits, each with one job:
+  - **Body bytes, `max_body_bytes = 16384`, → 413**, in raw ASGI middleware (`api/limits.py`). With
+    a `Content-Length` header, an oversized request is rejected before a byte of the body is read;
+    a chunked body is counted as it arrives and rejected once past the limit. Protects memory and
+    parsing.
+  - **Characters, `max_chars = 1000` per version, → 422**, in the input schema (C2.1). Protects the
+    Redis message and the tokenizer, which processes the whole string before truncating.
+  - **Reject, don't truncate,** at the API: truncating would change the client's input without
+    telling it. The 48-token truncation in the worker stays (documented behaviour, Stage 3).
+- **Sizing:** 1,000 is about 4× a 48-token English text. 16 KB is above the largest valid
+  sentiment body: the worst case is 1,000 characters that JSON escapes as 12 bytes each (an emoji,
+  a surrogate pair), 12,012 bytes, so the body limit never rejects input the schema would accept.
+- **Evidence:** reasoning; the 12,012-byte worst case is computed and checked in
+  `tests/test_api_predict.py::test_largest_valid_text_fits_the_body_limit`. No benchmark run.
+
+### C2.3: Deadline checks; timestamps are wall clock (D6; resolves P9)
+
+- **Before (P9):** check the deadline at pop and again just before compute; a dropped request
+  gets no reply, only a counter.
+- **After:** as proposed. In Stage 2 the worker computes right after popping, so the two checks
+  are the same check; Stage 3's batching wait separates them. A dropped request is logged with its
+  `request_id` and counted (a plain counter until Prometheus in Stage 6). No reply: the API's timer
+  and `deadline_ms` come from the same clock reading and the same 500 ms (C1.16), so the client has
+  already had its 504.
+- **Known limitation: cross-process timestamps assume synchronised clocks.** `deadline_ms` and
+  `enqueued_at_ms` are wall-clock times written by the API and read by the worker. Wall clock
+  because monotonic clocks can't be compared between processes (each has its own zero point). On
+  one machine the clocks are the same. Across hosts they agree only as well as NTP keeps them,
+  typically within milliseconds, and a wall clock can jump when NTP steps it.
+  - A worker clock **ahead** of the API's drops requests early and inflates `queue_wait_ms`.
+  - A worker clock **behind** computes requests that have already expired: wasted work, but no
+    wrong answers, because the API's 504 timer runs on its own monotonic clock (asyncio's loop
+    time), not on `deadline_ms`.
+  - **Stage 3** also uses `enqueued_at_ms` for `max_wait` (keep a batch open until
+    `enqueued_at_ms + max_wait`) and for `queue_wait_ms`. Skew shifts both: a worker clock 10 ms
+    ahead leaves a 15 ms `max_wait` only 5 ms. Stage 3 should decide whether to measure `max_wait`
+    from the worker's own (monotonic) pop time instead, which skew can't affect.
+- **Evidence:** reasoning; documented clock behaviour. No benchmark run.
+
+### C2.4: Redis URLs are secrets (C0.2; resolves P18)
+
+- **Before:** `redis_url` was a plain `str`, though a managed Redis URL carries a password
+  (`rediss://default:<password>@host:port`) and C0.2 says credentials are `SecretStr`.
+- **After:** `redis_url` is a `SecretStr`, unwrapped only where a client is created (the API's
+  lifespan, the worker's `main`). The response cache's separate instance (stretch S2, C1.22 R12)
+  gets a `cache_redis_url`, also a `SecretStr`. The secret-masking test is back.
+- **Evidence:** `tests/test_config.py::test_redis_url_is_masked_when_printed`.
+
+### C2.5: The HTTP contract and wire-format details (D2, D6, section 6; new)
+
+Not specified before Stage 2; decided while building it.
+
+- **Request:** `POST /v1/models/{name}/predict` with the input itself as the body
+  (`{"text": ...}` or `{"features": [...]}`). The model's serving version is chosen by the server
+  (one per model now; canary routing later).
+- **Success (200):** `{"request_id", "model", "version", "output"}`, with headers `X-Request-Id`,
+  `X-Model-Version` (D9) and `Server-Timing` (`app`, `queue`, `inference` durations in ms, a
+  standard header that the overhead benchmark reads).
+- **Errors** all have one shape, `{"error": {"code", "message", ...}}`, with `details` for schema
+  errors (location and message only, never the client's input echoed back) and `request_id` once
+  the request was enqueued:
+
+  | Status | `code` | When |
+  |---|---|---|
+  | 404 | `unknown_model` | no such model |
+  | 413 | `body_too_large` | body over `max_body_bytes` (C2.2) |
+  | 422 | `invalid_input` | bad JSON, schema failure (C2.1), or the runner's `InvalidInputError` |
+  | 500 | `inference_failed` | any other inference exception (C2.1) |
+  | 503 | `backend_unavailable` | the enqueue failed (Redis unreachable); `Retry-After: 1` |
+  | 504 | `timeout` | no reply within `request_timeout_ms` (C1.16) |
+
+- **503 when the queue is unreachable.** D6 reserves 503 for "the server is overloaded". A Redis
+  outage is a different cause with the same meaning for the client: the service can't take the
+  request now, retry later. HTTP defines 503 for exactly that, so it is used for both, and the
+  `code` tells them apart (Stage 4's overload 503 gets its own code). The alternative, 500, would
+  tell clients the failure is a bug rather than a temporary condition.
+- **Timestamps are fractional milliseconds** (`deadline_ms`, `enqueued_at_ms`). On one machine the
+  whole path takes a few milliseconds, and whole-millisecond values rounded `queue_wait_ms` to 0
+  or 1, making the overhead breakdown wrong by up to 1 ms. Seen in a smoke run while building this
+  stage (not a recorded benchmark).
+- **`reply_to` must match `replies:<32 hex>`**, checked by the worker when it decodes a request. A
+  forged or buggy message therefore can't make the worker push into any other key, such as a
+  request queue.
+- **Unknown message fields are ignored, missing required ones are errors,** so a newer process can
+  add a field without breaking an older one during a rolling restart.
+- **Queue order is FIFO:** the API `RPUSH`es, the worker pops from the head (`BLPOP` now,
+  `LPOP key count` in Stage 3).
+- **Evidence:** reasoning; behaviour pinned by `tests/test_api_predict.py`, `tests/test_protocol.py`,
+  `tests/test_body_limit.py`, `tests/test_roundtrip_redis.py`.
+
+### C2.6: Overhead is measured at light load and treated as a lower bound (C1.14, C1.16, C1.17, P10)
+
+- **Before:** C1.14's queue limit, C1.16's timeout margin and C1.17's recommended
+  `max_queue_depth` all assume 30 ms of overhead (everything outside inference), not measured.
+- **After:**
+  - `scripts/bench_overhead.py` sends requests **one at a time** through the full path (HTTP, API,
+    Redis, worker, reply listener) for each model, and reports p50/p90/p99 of end-to-end time,
+    inference time, and **overhead = end-to-end − inference**, split into HTTP (client to handler)
+    and RPC (inside the handler, minus queue wait and inference). The sklearn model's inference is
+    a fraction of a millisecond, so its end-to-end time is almost pure overhead: a cross-check.
+  - **The result is a lower bound.** With one request in flight nothing queues; under load the
+    event loop, Redis and the worker add waiting, so overhead grows. A queue limit derived from the
+    light-load number is therefore optimistic.
+  - **Stage 4** uses it provisionally to recompute `max_queue_depth` (C1.17). **Stage 7's load
+    test** checks whether accepted requests under overload really finish within 150 ms
+    (guarantee 2, C1.12), which is what P10 asks.
+- **Result:** not yet run. The figures and their result files
+  (`bench/results/stage2-overhead-{iris,sentiment}-*.json`) are added in a follow-up commit, once
+  the benchmark has been run natively on the M1.
+- **Evidence:** pending.
+
 ---
 
 # Part 3: Current values at a glance
@@ -1125,6 +1298,11 @@ If a core stage overruns, drop the `max_wait` sweep from Stage 7 before dropping
 | Scope | 13 stages, all built | **7 core stages + housekeeping; 3 stretch; registry, canary and demo deferred** | C1.23 |
 | Worker health endpoints | `/health/ready` with no server to host it | **HTTP thread in the worker: `/metrics`, `/health/live`, `/health/ready`** | C1.21 |
 | Backing services in Compose | Redis, Postgres, MinIO | **Redis only**; Postgres returns with S1, MinIO (Chainguard build) with the registry | C0.1, C1.23 |
+| Input validation | none | **per-version schema in the API (422 before enqueue); runner `InvalidInputError` → 422, any other exception → 500** | C2.1 |
+| Input size limits | unspecified | **body ≤ 16 KB (413), text ≤ 1,000 characters (422), then truncation to 48 tokens in the worker** | C2.2, C1.13 |
+| Redis URL | plain string | **`SecretStr`** (and the future `cache_redis_url`) | C2.4 |
+| Wire timestamps | integer ms | **fractional ms, wall clock (assumes synchronised clocks across hosts)** | C2.3, C2.5 |
+| Serving overhead | 30 ms assumed | **30 ms assumed; light-load measurement (a lower bound) pending** | C2.6 |
 | Benchmark result files | git-ignored | **committed in `bench/results/`; a test checks every cited file exists; new files record script and git commit** | C1.23 |
 
 ---
@@ -1140,12 +1318,7 @@ Not yet decided. When one is agreed, it moves to Part 2 under the stage that imp
   `models/sentiment/v3-<hash>.pt` assumes one file, but a saved Hugging Face model is a directory
   (`config.json`, `model.safetensors`, tokenizer files). Proposal: store each version as one
   `.tar`, so the immutable key, SHA-256 check and hash-keyed cache work unchanged.
-- **P3: per-model input validation in the API (Stages 2–3).** One malformed input in a batch makes
-  the whole batch fail. Proposal: the API validates input against a per-model schema before
-  enqueueing, and the worker returns a batch failure as an error to every request in it rather
-  than leaving them to time out. *Audit note:* the API never loads a model (D3), and the sklearn
-  feature count lives inside `model.joblib`, so validation limits (feature count, max characters)
-  must sit in per-version config the API can read. The reply message also needs an error code.
+- **P3: per-model input validation in the API.** Decided: see C2.1.
 
 The proposals below come from the design audit of 2026-11-10. Risks R1 and R2 are decided
 (C1.11, C1.13, C1.14). The rest are not yet reviewed.
@@ -1154,10 +1327,8 @@ The proposals below come from the design audit of 2026-11-10. Risks R1 and R2 ar
 - **P5: where benchmark numbers come from.** Decided: see C1.15.
 - **P6: request timeout.** Decided: see C1.16.
 - **P7: `max_queue_depth` is explicit.** Decided: see C1.17.
-- **P8: input size cap at the API (C1.13).** About 250 characters as a proxy for 48 tokens. Reject
-  (413) or truncate: decide in Stage 2.
-- **P9: deadline checks (Stages 2–3).** Check at pop and again just before compute. A dropped
-  request gets no reply, only a counter; the API has already returned 504.
+- **P8: input size cap at the API.** Decided: see C2.2.
+- **P9: deadline checks.** Decided: see C2.3.
 - **P10: target-load definition (C1.12).** The only measured throughput is model-only and native.
   Proposal: define 70% against end-to-end saturation throughput from the load test, and treat
   guarantee 2 as a target the load test verifies, since the bound adds p99s and the queue limit is
@@ -1171,8 +1342,4 @@ The proposals below come from the design audit of 2026-11-10. Risks R1 and R2 ar
 - **P16: sklearn batching (C1.8).** C1.8's reason argues for `max_wait_ms = 0`, not for
   `max_batch_size = 1`. Proposal: try `max_wait_ms = 0` with a larger batch size in the load test.
 - **P17: recorded for deferred stages.** Decided: see C1.22.
-- **P18: `redis_url` as a secret (C0.2; Stage 2).** Raised in Stage 1.5. Locally the URL has no
-  password, but a managed Redis URL does (`rediss://default:<password>@host:port`), and
-  `redis_url` is a plain `str`, so logging the settings would print it. C0.2 says credentials are
-  `SecretStr`. Proposal: make `redis_url` a `SecretStr` in Stage 2, where the Redis client is
-  first created, and unwrap it only at that call.
+- **P18: `redis_url` as a secret.** Decided: see C2.4.

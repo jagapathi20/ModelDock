@@ -13,7 +13,7 @@ import pytest
 torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 
-from worker.runners import ModelNotLoadedError, build_runner  # noqa: E402
+from worker.runners import InvalidInputError, ModelNotLoadedError, build_runner  # noqa: E402
 from worker.runners.transformer import (  # noqa: E402
     TransformerClassifierRunner,
     configure_cpu_threads,
@@ -124,6 +124,13 @@ def test_output_order_matches_input_order(runner, monkeypatch):
             [expected[i] for i in order], abs=1e-6
         )
         assert all(o["label"] == "POSITIVE" for o in outputs)  # label 1 always wins: n > 0
+
+
+@pytest.mark.parametrize("bad", [{"text": ""}, {"text": 5}, {"txt": "good"}, "good"])
+def test_rejected_inputs_raise_invalid_input_error(runner, bad):
+    with pytest.raises(InvalidInputError) as exc:
+        runner.predict_batch([{"text": "good"}, bad])
+    assert exc.value.index == 1
 
 
 def test_empty_batch_returns_empty_list(runner):
