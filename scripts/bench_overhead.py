@@ -42,8 +42,10 @@ from typing import Any
 
 import httpx
 
+from common.config import get_settings
 from scripts.bench_batching import machine_info, make_iris_features, make_texts, percentile
 from scripts.provenance import provenance
+from scripts.redis_info import describe, redis_server_info
 
 LOWER_BOUND_NOTE = (
     "Light load, one request in flight: a lower bound on overhead. Overhead grows under load; "
@@ -154,8 +156,12 @@ def main() -> None:
         result = run(client, args.model, inputs, args.warmup)
 
     info = machine_info(threads=None)  # the worker's threads are set in the worker process
+    # The Redis the API and worker use (same settings): recorded, because localhost:6379 can be
+    # a native Redis instead of the Compose container (scripts/redis_info.py).
+    info["redis"] = redis_server_info(get_settings().redis_url.get_secret_value())
     prov = provenance("bench_overhead.py")
-    print(f"{args.model}: sequential requests to {args.url}\n")
+    print(f"{args.model}: sequential requests to {args.url}")
+    print(describe(info["redis"]) + "\n")
     print(render(result))
 
     out = args.out or Path("bench/results") / (

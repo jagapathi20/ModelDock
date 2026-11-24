@@ -20,6 +20,7 @@ import redis
 
 from scripts.bench_batching import machine_info, percentile
 from scripts.provenance import provenance
+from scripts.redis_info import describe, redis_server_info
 
 
 def main() -> None:
@@ -31,8 +32,10 @@ def main() -> None:
     args = p.parse_args()
 
     r = redis.Redis.from_url(args.url, socket_timeout=5)
-    server = r.info("server")
-    hz = r.config_get("hz").get("hz")
+    server = redis_server_info(args.url)
+    if server is None:
+        raise SystemExit(f"no Redis at {args.url}: start it with `docker compose up -d`")
+    print(describe(server) + "\n")
     key = f"timeout-probe:{uuid.uuid4().hex}"  # never pushed to
 
     results = []
@@ -63,15 +66,14 @@ def main() -> None:
         json.dumps(
             {
                 "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-                "machine": machine_info(threads=None)
-                | {"redis_version": server.get("redis_version"), "redis_hz": hz},
+                "machine": machine_info(threads=None) | {"redis": server},
                 "provenance": prov,
                 "results": results,
             },
             indent=2,
         )
     )
-    print(f"\nRedis {server.get('redis_version')}, hz={hz}\nwrote {out}")
+    print(f"\nwrote {out}")
     if prov["git"] is None or prov["git"]["dirty"]:
         print("warning: result not traceable to a commit (no git, or uncommitted changes)")
 
