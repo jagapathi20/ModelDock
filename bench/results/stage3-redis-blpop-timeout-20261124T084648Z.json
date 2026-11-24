@@ -1,0 +1,65 @@
+{
+  "args": {
+    "url": "redis://localhost:6379/14",
+    "timeouts_ms": "1,5,15,50,200",
+    "samples": 20,
+    "out": null
+  },
+  "machine": {
+    "platform": "macOS-26.1-arm64-arm-64bit",
+    "python": "3.12.11",
+    "cpu_count_logical": 8,
+    "cpu_model": "Apple M1",
+    "inference_threads": null,
+    "performance_cores": 4,
+    "efficiency_cores": 4,
+    "torch": "2.15.0",
+    "transformers": "5.22.1",
+    "torch_num_threads": 4,
+    "redis": {
+      "redis_version": "7.4.12",
+      "os": "Linux 7.0.14-linuxkit aarch64",
+      "redis_mode": "standalone",
+      "hz": "10"
+    }
+  },
+  "provenance": {
+    "script": "check_redis_timeouts.py",
+    "git": {
+      "commit": "ee7dace5e416bed4b945a6deb808e34956158568",
+      "dirty": false
+    }
+  },
+  "results": [
+    {
+      "timeout_ms": 1.0,
+      "elapsed_ms_min": 42.37179099982313,
+      "elapsed_ms_p50": 106.65400000016234,
+      "elapsed_ms_max": 107.84449999982826
+    },
+    {
+      "timeout_ms": 5.0,
+      "elapsed_ms_min": 102.42574999983844,
+      "elapsed_ms_p50": 106.3561670002855,
+      "elapsed_ms_max": 108.03199999963908
+    },
+    {
+      "timeout_ms": 15.0,
+      "elapsed_ms_min": 101.52212499997404,
+      "elapsed_ms_p50": 106.68808299988086,
+      "elapsed_ms_max": 108.40304200019091
+    },
+    {
+      "timeout_ms": 50.0,
+      "elapsed_ms_min": 100.99929199986946,
+      "elapsed_ms_p50": 106.45812500024476,
+      "elapsed_ms_max": 107.95975000019098
+    },
+    {
+      "timeout_ms": 200.0,
+      "elapsed_ms_min": 202.28191700016396,
+      "elapsed_ms_p50": 209.924208999837,
+      "elapsed_ms_max": 214.1052080000918
+    }
+  ]
+}

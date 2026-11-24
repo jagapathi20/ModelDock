@@ -22,7 +22,8 @@ Before this stage (Stages 0–2):
   classifier (inference ~0.15 ms; batching off).
 - Measured so far (all on an Apple M1, model only): a batch of 4 inputs of 48 tokens takes
   38.9 ms at p99, a batch of 8 takes 64.5 ms (run I, C1.14); serving overhead outside inference is
-  1.77 ms at p99 at light load (C2.6).
+  9.00 ms at p99 at light load on the Compose Redis (C2.6, re-measured in this stage; see
+  section 9).
 
 The design decisions this stage implements:
 
@@ -113,8 +114,9 @@ or when the window ends. **It doesn't work, because Redis's blocking timeouts ar
 is single-threaded with an event loop; it checks blocked clients' timeouts from its periodic
 timer, which runs `hz` times a second (default 10). A `BLPOP` returns immediately when an element
 is pushed, but if nothing arrives its timeout is noticed only at the next timer tick, up to
-~100 ms late. While building this stage (Linux, Redis 7.0.15), 5, 15 and 50 ms timeouts all took
-a median of about 100 ms; with `hz 100`, a 15 ms timeout still took about 21 ms. The timeout is
+~100 ms late. On the M1 against the Compose Redis, 1, 5, 15 and 50 ms timeouts all took a median
+of about 106 ms, and 200 ms took 210 ms (`bench/results/stage3-redis-blpop-timeout-20261124T084648Z.json`, recorded with `scripts/check_redis_timeouts.py`;
+C3.1 has the table). The timeout is
 exactly the light-load case, where `max_wait` decides latency, so a 15 ms window would have
 become ~100 ms, two thirds of the whole latency budget.
 
@@ -237,19 +239,20 @@ git checkout <that commit>^                                        # its parent
 ```
 
 Its budget is now C1.11's, for `--max-batch-size` (default 4), `--max-wait-ms` (15),
-`--overhead-ms` (default 1.77, C2.6's measurement, cited next to the default) and `--workers`:
+`--overhead-ms` (default 9.00, C2.6's measurement on the Compose Redis, cited next to the
+default) and `--workers`:
 
 ```
 Latency budget (C1.11): max_batch_size=4, max_wait=15 ms, T (full batch p99)=38.9 ms, ...
-  light_load                      55.7 ms   ok        max_wait + T + overhead
-  saturated_empty_queue           79.6 ms   ok        2T + overhead
-  at_queue_limit                 118.5 ms   ok        T × (1 + ceil(D / B)) + overhead
+  light_load                      62.9 ms   ok        max_wait + T + overhead
+  saturated_empty_queue           86.8 ms   ok        2T + overhead
+  at_queue_limit                 125.7 ms   ok        T × (1 + ceil(D / B)) + overhead
   recommended max_queue_depth: 8 (m=2, workers=1)
 ```
 
 (These lines are worked by hand from run I's T,
 `bench/results/stage1-transformer_classifier-20261110T105742Z.json`, not printed by a new run;
-`tests/test_bench.py` checks the function gives exactly C2.6's 8 and 118.47 ms.) If even an empty queue misses the target, it says so
+`tests/test_bench.py` checks the function gives exactly C2.6's 8 and 125.7 ms.) If even an empty queue misses the target, it says so
 instead of recommending a limit. `max_queue_depth` stays an explicit setting chosen from this
 output (C1.17): Stage 4 sets it.
 
@@ -271,13 +274,26 @@ Two defaults keep Stage 1's commands meaning what they meant: `--max-length 128`
 Timing tests use generous bounds (a 60 ms window must take 50–150 ms) so a busy laptop doesn't
 make them flaky.
 
-## 9. How this connects to the next stages
+## 9. Which Redis a benchmark measured (C3.6)
+
+`localhost:6379` isn't necessarily the Compose container. A Redis installed natively (e.g. with
+Homebrew) keeps answering when Docker is stopped, and on macOS both can listen at once. That
+happened during this stage. So `bench_overhead.py` and `check_redis_timeouts.py` now record the
+server's version, `os` and `hz` in each result (`machine.redis`, from `scripts/redis_info.py`) and
+warn when the `os` isn't Linux. Check before measuring: `lsof -nP -iTCP:6379 -sTCP:LISTEN` should
+show only Docker.
+
+## 10. How this connects to the next stages
 
 - **Stage 4 (backpressure)** adds the `LLEN` check before the API's `RPUSH`: 503 `overloaded` with
   `Retry-After: 1` once the queue holds `max_queue_depth` requests, set from this stage's
   benchmark output. Because the loop holds no formed batches (C1.11), `LLEN` sees the whole
   backlog.
-- **Stage 5** serves `last_loop_at` on a health thread and turns `stop()` into SIGTERM handling.
+- **Stage 5** serves `last_loop_at` on a health thread and turns `stop()` into SIGTERM handling,
+  and adds the **warm-up batch** before the worker reports ready (D12, C1.21). It's a known gap
+  until then: the first forward pass after startup is much slower than the rest (PyTorch allocates
+  memory and picks kernels on first use; a manual check showed it clearly, not yet measured), so
+  the first requests after a worker starts can miss 150 ms. Stage 5 measures it.
 - **Stage 6** turns `WorkerStats` (including `batch_sizes`) and the four timings into Prometheus
   histograms.
 - **Stage 7's load test** settles P19 (batch size 4 or 8) and P16 (sklearn batching).
@@ -288,6 +304,7 @@ make them flaky.
 uv sync --extra worker
 uv run ruff check . && uv run ruff format --check .
 uv run pytest -v
+uv run python -m scripts.check_redis_timeouts           # records C3.1's evidence
 
 # Batching, by hand: one sentiment worker, one API
 uv run python -m worker                                  # terminal 1 (sentiment v1)

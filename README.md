@@ -63,9 +63,10 @@ uv run python -m scripts.bench_batching --model-dir artifacts/sentiment-v1 \
   because batch time tracks total tokens (see [`docs/DESIGN.md`](docs/DESIGN.md), C1.13).
 
 - [Stage 2: serving overhead](docs/DESIGN.md#c26-overhead-is-measured-at-light-load-and-treated-as-a-lower-bound-c114-c116-c117-p10):
-  on an Apple M1 at light load (one request in flight), the full path (HTTP, API, Redis, worker,
-  reply) adds 1.77 ms at p99 on top of inference for the sentiment model, and 1.10 ms for iris.
-  A lower bound: overhead grows under load. Results: `bench/results/stage2-overhead-sentiment-20261122T093415Z.json`, `bench/results/stage2-overhead-iris-20261122T092735Z.json`.
+  on an Apple M1 at light load (one request in flight, Redis in Docker), the full path (HTTP,
+  API, Redis, worker, reply) adds 9.0 ms at p99 on top of inference and the 15 ms batching window
+  for the sentiment model, and 3.8 ms for iris. A lower bound: overhead grows under load.
+  Results: `bench/results/stage2-overhead-sentiment-20261124T085404Z.json`, `bench/results/stage2-overhead-iris-20261124T085239Z.json`.
 
 ## Checks
 

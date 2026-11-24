@@ -352,9 +352,9 @@ def main() -> None:
     p.add_argument(
         "--overhead-ms",
         type=float,
-        # Sentiment p99 overhead at light load, C2.6:
-        # bench/results/stage2-overhead-sentiment-20261122T093415Z.json
-        default=1.77,
+        # Sentiment p99 overhead at light load on the Compose Redis, C2.6:
+        # bench/results/stage2-overhead-sentiment-20261124T085404Z.json
+        default=9.00,
         help="everything outside inference, for the budget (default: C2.6's measurement)",
     )
     p.add_argument("--workers", type=int, default=1, help="workers for this version (C1.17)")

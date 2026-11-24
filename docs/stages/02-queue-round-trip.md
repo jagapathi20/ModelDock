@@ -356,7 +356,10 @@ The sklearn model's inference takes a fraction of a millisecond, so for iris `e2
 pure overhead, a cross-check for the sentiment figure, which subtracts a much larger inference
 time.
 
-**Results** (Apple M1, native; full table and reasoning in C2.6):
+**Results.** *Superseded:* these runs don't record which Redis answered, and most likely hit a
+native Redis rather than the container (C3.6). The re-measurement on the Compose Redis, in C2.6,
+gives 9.00 ms (sentiment) and 3.78 ms (iris) at p99, with the same consequence for the queue
+limit (8 per worker). The original figures, kept because they are cited:
 
 | p99, ms | iris | sentiment |
 |---|---|---|

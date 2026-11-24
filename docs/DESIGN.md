@@ -743,8 +743,9 @@ Ignore it; the budgets below are computed by hand from the measured T.
   - `bench/results/stage1-transformer_classifier-20261110T104036Z.json` (run H): 64 tokens fails even at the median (62.0 ms)
   - `bench/results/stage1-sklearn_classifier-20261106T150255Z.json` (run S): sklearn T for its queue limit
 
-> **Revisited in C2.6:** measured overhead is 1.77 ms (p99, light load), not 30 ms. Batch 8 would
-> fit (130.8 ms saturated); batch 4 stays until the load-test stage compares them end to end (P19).
+> **Revisited in C2.6:** measured overhead is 9.00 ms (p99, light load, Compose Redis), not 30 ms.
+> Batch 8 would fit (138.0 ms saturated); batch 4 stays until the load-test stage compares them end
+> to end (P19).
 
 ### C1.15: Benchmarks run natively, not in Docker Compose (D14, C1.5; resolves P5)
 
@@ -823,7 +824,7 @@ Ignore it; the budgets below are computed by hand from the measured T.
 - **Evidence:** reasoning; no benchmark run. The 147 ms worst case comes from
   `bench/results/stage1-transformer_classifier-20261110T105742Z.json` (run I, via C1.14).
 
-> **Revisited in C2.6:** with measured overhead the worst case at the queue limit is 118.5 ms; the
+> **Revisited in C2.6:** with measured overhead the worst case at the queue limit is 125.7 ms; the
 > 500 ms timeout is unchanged.
 
 ### C1.17: `max_queue_depth` is an explicit setting, computed offline (D6, C1.7; resolves P7)
@@ -866,8 +867,8 @@ Ignore it; the budgets below are computed by hand from the measured T.
   transformer) comes from
   `bench/results/stage1-transformer_classifier-20261110T105742Z.json` (run I, via C1.14).
 
-> **Revisited in C2.6:** with measured overhead (1.77 ms) the recommendation is still 8 per worker
-> for the transformer at batch 4; Stage 4 sets it, and the load test checks it (P10).
+> **Revisited in C2.6:** with measured overhead (9.00 ms, Compose Redis) the recommendation is still
+> 8 per worker for the transformer at batch 4; Stage 4 sets it, and the load test checks it (P10).
 
 ### C1.18: The worker sets the reply list's expiry (D4, section 6; resolves P11)
 
@@ -1330,6 +1331,33 @@ Not specified before Stage 2; decided while building it.
   - `bench/results/stage2-overhead-sentiment-20261122T093415Z.json`: sentiment figures
   - `bench/results/stage1-transformer_classifier-20261110T105742Z.json` (run I): T at batch 4 and 8, and the 137 / 167 items/s
 
+> **Re-measured on the Compose Redis (2026-11-24); these figures replace the ones above.** In
+> Stage 3 it turned out that a Redis installed natively on the M1 had been answering on
+> `localhost:6379` whenever Docker was stopped (C3.6). The runs above don't record which Redis
+> they used. Re-run with the Stage 3 code (iris worker with 1 thread, C3.2; sentiment batching
+> with its 15 ms window, reported separately as batch wait and excluded from overhead), against
+> Redis 7.4.12 in its container:
+>
+> | ms | iris p50 | iris p99 | sentiment p50 | sentiment p99 |
+> |---|---|---|---|---|
+> | **Overhead** | **1.56** | **3.78** | **3.05** | **9.00** |
+> | of which HTTP | 0.58 | 1.06 | 0.76 | 1.01 |
+> | of which RPC | 0.54 | 1.08 | 1.48 | 6.89 |
+> | Queue wait | 0.43 | 0.81 | 0.77 | 1.96 |
+> | Inference | 0.22 | 0.47 | 17.37 | 21.70 |
+> | Batch wait (the window, not overhead) | 0.03 | 0.07 | 14.75 | 15.36 |
+>
+> - **The earlier runs most likely hit the native Redis.** iris's path barely changed between the
+>   two runs (it doesn't batch), yet its queue wait doubled (0.21 → 0.43 ms at p50): each Redis
+>   round trip now crosses Docker Desktop's VM network. Likely, not proven.
+> - **Sentiment's tail grew far more than iris's** (RPC p99 0.69 → 6.89 ms). Two things changed
+>   together, the Redis and the Stage 3 worker (which polls Redis every 1 ms while a batch window
+>   is open), so the cause isn't separated. Open as P20.
+> - **Consequences, with 9.00 ms:** `max_queue_depth` stays **8 per worker** at batch 4 (m = 2);
+>   the worst case at the limit is **125.7 ms** (was 118.5); batch 8 saturated with an empty queue
+>   is **138.0 ms**, still under 150 but with 12 ms to spare instead of 19 (P19).
+> - Evidence: `bench/results/stage2-overhead-iris-20261124T085239Z.json`, `bench/results/stage2-overhead-sentiment-20261124T085404Z.json`.
+
 ## Stage 3: batching
 
 Sources: the Stage 3 proposals (Q1 to Q4), accepted 2026-11-24, and a Redis behaviour found while
@@ -1347,10 +1375,19 @@ building. Details in [`stages/03-batching.md`](stages/03-batching.md).
   - **Redis's blocking timeouts are coarse.** Redis checks blocked clients' timeouts on its
     internal timer, `hz` (10 per second by default), not exactly when they fall due. A `BLPOP`
     returns at once when an element arrives, but **its timeout can fire up to about 100 ms late**.
-    Seen while building this stage (Linux, Redis 7.0.15, not a recorded benchmark): 5, 15 and
-    50 ms timeouts all returned after a median of about 100 ms; with `hz` raised to 100, a 15 ms
-    timeout took about 21 ms. The timeout is exactly the light-load case, where `max_wait` matters,
-    so a 15 ms window would have become about 100 ms.
+    Measured on the M1 against the Compose Redis (7.4.12, `hz` 10;
+    `scripts/check_redis_timeouts.py`, 20 samples each):
+
+    | `BLPOP` timeout | 1 ms | 5 ms | 15 ms | 50 ms | 200 ms |
+    |---|---|---|---|---|---|
+    | Median elapsed | 106.7 ms | 106.4 ms | 106.7 ms | 106.5 ms | 209.9 ms |
+    | Max elapsed | 107.8 ms | 108.0 ms | 108.4 ms | 108.0 ms | 214.1 ms |
+
+    Every short timeout fires at the next tick of a 10-per-second timer. The timeout is exactly the
+    light-load case, where `max_wait` matters, so a 15 ms window would have become about 100 ms.
+    The same happened on two other servers (a native Redis 8.10.2 on the M1, and Redis 7.0.15 on
+    Linux while building; neither kept as a result), and on the latter, raising `hz` to 100 still
+    left a 15 ms timeout at about 21 ms.
 - **After:**
   - **The window runs from the first request's arrival, with the queue time clamped:**
     `remaining = max_wait − clamp(now_ms() − enqueued_at_ms, 0, max_wait)`, computed when that
@@ -1375,9 +1412,11 @@ building. Details in [`stages/03-batching.md`](stages/03-batching.md).
   - Measuring the window from the worker's pop time (C2.3's alternative): skew-proof, but a request
     that already queued 40 ms would wait up to 15 ms more for company, adding latency exactly when
     the system is behind.
-- **Evidence:** documented Redis behaviour (`hz` drives the handling of client timeouts); the
-  workspace observation above; `tests/test_worker.py` (window, clamp under simulated skew, time
-  and size triggers, a batch closing soon after it fills).
+- **Evidence:**
+  - `bench/results/stage3-redis-blpop-timeout-20261124T084648Z.json`: the timeout table above
+  - documented Redis behaviour (`hz` drives the handling of client timeouts)
+  - `tests/test_worker.py`: window, clamp under simulated skew, time and size triggers, a batch
+    closing soon after it fills
 
 ### C3.2: Every native thread pool in a worker is capped (D7, C1.5; resolves P15)
 
@@ -1429,7 +1468,7 @@ building. Details in [`stages/03-batching.md`](stages/03-batching.md).
     scripts/bench_batching_1.py` names the commit that deleted the copy; check out its parent.
   - **The budget is C1.11's** (light load, saturated with an empty queue, at the queue limit) and
     the script prints the **recommended `max_queue_depth`** (C1.17), or says that no limit meets
-    the target. New flags: `--overhead-ms` (default 1.77, C2.6's measurement, cited in the code),
+    the target. New flags: `--overhead-ms` (default 9.00, C2.6's re-measurement on the Compose Redis, cited in the code),
     `--workers`.
   - **Defaults that keep Stage 1's commands meaning what they meant:** `--max-length` (new)
     defaults to 128 and `--threads` to all logical cores, as in Stage 1. Both are recorded in each
@@ -1437,7 +1476,7 @@ building. Details in [`stages/03-batching.md`](stages/03-batching.md).
     design (`--max-batch-size 4`); they don't affect the measurements.
   - Transformer runs also cap the native thread pools (C3.2).
 - **Evidence:** `tests/test_bench.py` (the formulas with hand-worked values, scaling with workers,
-  the no-limit case, and C2.6's numbers reproduced: 8 per worker, 118.47 ms at the limit).
+  the no-limit case, and C2.6's numbers reproduced: 8 per worker, 125.7 ms at the limit).
 
 ### C3.5: Batching settings live in the catalog; what each timing measures (D5, D13, section 6)
 
@@ -1456,6 +1495,21 @@ building. Details in [`stages/03-batching.md`](stages/03-batching.md).
 - **Evidence:** `tests/test_worker.py`, `tests/test_api_predict.py`,
   `tests/test_roundtrip_redis.py::test_concurrent_requests_are_batched` (real Redis, real iris
   model, batching on: concurrent requests share model calls and each gets its own answer).
+
+### C3.6: Benchmarks record which Redis they ran against (C1.15)
+
+- **Before:** C1.15 says benchmark numbers come from a native setup with Redis in Docker. Result
+  files recorded the machine and the code (provenance), but not the Redis server.
+- **What broke:** with Docker stopped, a Redis installed natively on the M1 (8.10.2) kept answering
+  on `localhost:6379`, so Stage 3's first timeout measurement, and most likely Stage 2's overhead
+  runs, measured it instead of the container. On macOS both can even listen at once (Docker on
+  `*:6379`, a native server on `127.0.0.1:6379`), and which one `localhost` reaches then depends on
+  name resolution. Nothing in the results showed it; the version number in a printout did.
+- **After:** `scripts/redis_info.py` reads `INFO server` (version, `os`, mode) and `hz` from the
+  Redis the benchmark uses; `bench_overhead.py` and `check_redis_timeouts.py` write it into the
+  result's `machine.redis` and print it. If the server's `os` isn't Linux (the container runs in
+  Docker Desktop's Linux VM; a native macOS Redis reports Darwin), they print a warning.
+- **Evidence:** the incident above; `tests/test_redis_info.py`.
 
 ---
 
@@ -1487,8 +1541,9 @@ building. Details in [`stages/03-batching.md`](stages/03-batching.md).
 | Input size limits | unspecified | **body ≤ 16 KB (413), text ≤ 1,000 characters (422), then truncation to 48 tokens in the worker** | C2.2, C1.13 |
 | Redis URL | plain string | **`SecretStr`** (and the future `cache_redis_url`) | C2.4 |
 | Wire timestamps | integer ms | **fractional ms, wall clock (assumes synchronised clocks across hosts)** | C2.3, C2.5 |
-| Serving overhead | 30 ms assumed | **1.77 ms p99 (sentiment), 1.10 ms (iris), at light load: a lower bound** | C2.6 |
+| Serving overhead | 30 ms assumed | **9.00 ms p99 (sentiment), 3.78 ms (iris), Compose Redis, light load: a lower bound** | C2.6 |
 | Batching benchmark | two scripts, Stage 1 budget | **one script, C1.11 budget, recommended `max_queue_depth`** | C3.4 |
+| Benchmark Redis | assumed to be the container | **recorded in every result (version, OS, `hz`); warning if not the container** | C3.6 |
 | Benchmark result files | git-ignored | **committed in `bench/results/`; a test checks every cited file exists; new files record script and git commit** | C1.23 |
 
 ---
@@ -1529,7 +1584,13 @@ The proposals below come from the design audit of 2026-11-10. Risks R1 and R2 ar
 - **P17: recorded for deferred stages.** Decided: see C1.22.
 - **P18: `redis_url` as a secret.** Decided: see C2.4.
 - **P19: `max_batch_size` 4 or 8 (C1.14, C2.6; load-test stage).** Raised in Stage 2. With
-  measured overhead, batch 8 fits the budget on paper (130.8 ms saturated, `max_queue_depth` 8 per
-  worker, as for batch 4) and gives 22% more peak throughput per worker. Proposal: keep 4 through
+  measured overhead, batch 8 fits the budget on paper (138.0 ms saturated with 9.00 ms overhead,
+  `max_queue_depth` 8 per worker, as for batch 4) and gives 22% more peak throughput per worker. Proposal: keep 4 through
   Stages 3–6; in the load test, compare 4 and 8 end to end under overload and adopt 8 only if
   accepted requests still meet 150 ms at p99.
+- **P20: sentiment's overhead tail (C2.6).** Raised in Stage 3. On the Compose Redis, sentiment's
+  RPC part of overhead is 6.89 ms at p99 against iris's 1.08 ms. Candidates, not yet tested: the
+  worker polling Redis every 1 ms during each batch window (C3.1); PyTorch's OpenMP threads
+  spinning after each forward pass and competing for cores with the API, the client and Docker's
+  VM. Proposal: measure before the load test, e.g. sentiment with `max_wait_ms = 0` (no polling),
+  and with `OMP_WAIT_POLICY=PASSIVE` (threads sleep instead of spinning).

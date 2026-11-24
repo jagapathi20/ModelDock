@@ -106,12 +106,18 @@ def test_no_queue_limit_when_even_an_empty_queue_misses():
 
 
 def test_stage2_numbers_reproduce_c26():
-    """The budget function gives C2.6's table (run I's T at batch 4, overhead 1.77)."""
+    """The budget function gives C2.6's figures: run I's T at batch 4 with 9.00 ms overhead
+    (Compose Redis re-measurement), and with the superseded 1.77 ms."""
     budget = latency_budget(
-        [_result(4, 38.9)], max_batch_size=4, max_wait_ms=15, target_ms=150, overhead_ms=1.77
+        [_result(4, 38.9)], max_batch_size=4, max_wait_ms=15, target_ms=150, overhead_ms=9.0
     )
     assert budget["recommended_max_queue_depth"] == 8
-    assert budget["worst_case_ms"]["at_queue_limit"] == pytest.approx(118.47)
+    assert budget["worst_case_ms"]["at_queue_limit"] == pytest.approx(125.7)
+    assert budget["worst_case_ms"]["saturated_empty_queue"] == pytest.approx(86.8)
+    old = latency_budget(
+        [_result(4, 38.9)], max_batch_size=4, max_wait_ms=15, target_ms=150, overhead_ms=1.77
+    )
+    assert old["worst_case_ms"]["at_queue_limit"] == pytest.approx(118.47)
 
 
 def test_latency_budget_needs_the_configured_batch_size():

@@ -1,0 +1,92 @@
+{
+  "args": {
+    "url": "http://localhost:8000",
+    "model": "sentiment",
+    "requests": 1000,
+    "warmup": 50,
+    "words": 46,
+    "seed": 0,
+    "out": null
+  },
+  "machine": {
+    "platform": "macOS-26.1-arm64-arm-64bit",
+    "python": "3.12.11",
+    "cpu_count_logical": 8,
+    "cpu_model": "Apple M1",
+    "inference_threads": null,
+    "performance_cores": 4,
+    "efficiency_cores": 4,
+    "torch": "2.15.0",
+    "transformers": "5.22.1",
+    "torch_num_threads": 4,
+    "redis": {
+      "redis_version": "7.4.12",
+      "os": "Linux 7.0.14-linuxkit aarch64",
+      "redis_mode": "standalone",
+      "hz": "10"
+    }
+  },
+  "provenance": {
+    "script": "bench_overhead.py",
+    "git": {
+      "commit": "ee7dace5e416bed4b945a6deb808e34956158568",
+      "dirty": false
+    }
+  },
+  "note": "Light load, one request in flight: a lower bound on overhead. Overhead grows under load; a queue limit derived from this is optimistic until the Stage 7 load test checks it (C2.6).",
+  "results": {
+    "measured_requests": 1000,
+    "errors_by_status": {},
+    "stats_ms": {
+      "e2e_ms": {
+        "p50": 35.208624999540916,
+        "p90": 36.62570799951936,
+        "p99": 42.82112500004587,
+        "max": 48.98979200015674,
+        "mean": 35.638520750011146
+      },
+      "inference_ms": {
+        "p50": 17.372,
+        "p90": 18.352,
+        "p99": 21.7,
+        "max": 29.419,
+        "mean": 17.653894
+      },
+      "overhead_ms": {
+        "p50": 3.045250000075061,
+        "p90": 3.7834580001606977,
+        "p99": 9.003542000349205,
+        "max": 11.073667000009241,
+        "mean": 3.295919750011139
+      },
+      "http_ms": {
+        "p50": 0.7630839994716823,
+        "p90": 0.822500000220316,
+        "p99": 1.0146670001094193,
+        "max": 8.777667000009245,
+        "mean": 0.7839417500111391
+      },
+      "rpc_ms": {
+        "p50": 1.4769999999999968,
+        "p90": 1.8739999999999988,
+        "p99": 6.888000000000002,
+        "max": 8.652999999999999,
+        "mean": 1.6794120000000001
+      },
+      "queue_ms": {
+        "p50": 0.773,
+        "p90": 1.019,
+        "p99": 1.963,
+        "max": 6.77,
+        "mean": 0.832566
+      },
+      "batch_ms": {
+        "p50": 14.747,
+        "p90": 14.984,
+        "p99": 15.357,
+        "max": 17.89,
+        "mean": 14.688707
+      }
+    }
+  }
+}
