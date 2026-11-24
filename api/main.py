@@ -141,10 +141,12 @@ def _reply_response(model: str, reply: ReplyMessage, app_ms: float) -> JSONRespo
         if reply.timings is not None:
             # Server-Timing is a standard header for server-side timings (browsers' dev tools
             # show it). The overhead benchmark reads it: app = time inside this handler.
+            t = reply.timings
             headers["Server-Timing"] = (
-                f"app;dur={app_ms:.3f}, queue;dur={reply.timings.queue_wait_ms:.3f}, "
-                f"inference;dur={reply.timings.inference_ms:.3f}"
+                f"app;dur={app_ms:.3f}, queue;dur={t.queue_wait_ms:.3f}, "
+                f"batch;dur={t.batch_wait_ms:.3f}, inference;dur={t.inference_ms:.3f}"
             )
+            headers["X-Batch-Size"] = str(t.batch_size)
         body = {
             "request_id": reply.request_id,
             "model": model,

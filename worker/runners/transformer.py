@@ -26,7 +26,8 @@ from worker.runners.base import InvalidInputError, JsonDict, ModelRunner
 # padded to its *longest* input, so one 512-token input would make every other
 # request in its batch pay for 512 tokens. Capping bounds the worst-case batch
 # cost. Inputs longer than this are truncated (the start of the text is kept).
-# Stage 3 replaces this default with a per-version setting of 48 (C1.13).
+# The worker always passes the catalog's per-version value (48 for sentiment v1, C1.13). This
+# default is what Stage 1's benchmark runs used; it stays for their reproducibility (C3.4).
 DEFAULT_MAX_LENGTH = 128
 
 
@@ -48,6 +49,14 @@ def configure_cpu_threads(num_threads: int) -> None:
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     # Intra-op threads: how many threads one operator (e.g. one matmul) uses.
     torch.set_num_threads(num_threads)
+    # Inter-op threads run independent operators in parallel. One forward pass of a sequential
+    # model gains nothing from them, so cap the pool at 1 (C3.2). PyTorch allows setting this
+    # only once, before any inter-op work, so a second call (tests, the benchmark) is skipped.
+    if torch.get_num_interop_threads() != 1:
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
 
 
 class TransformerClassifierRunner(ModelRunner):

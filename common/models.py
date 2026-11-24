@@ -49,13 +49,26 @@ class ModelSpec:
     kind: RunnerKind
     artifact: str  # directory name under Settings.artifacts_dir
     max_chars: int | None = None  # text models: longest accepted text, in characters (C2.2)
+    max_length: int | None = None  # text models: tokens kept; longer inputs truncated (C1.13)
     n_features: int | None = None  # feature models: exact number of features
+    # Batching (D5, C1.11): a batch runs when it holds max_batch_size requests, or when
+    # max_wait_ms has passed since its first request arrived, whichever comes first.
+    max_batch_size: int = 1
+    max_wait_ms: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.kind == "transformer_classifier" and not self.max_chars:
-            raise ValueError(f"{self.name} v{self.version}: text models need max_chars")
+        where = f"{self.name} v{self.version}"
+        if self.kind == "transformer_classifier" and not (self.max_chars and self.max_length):
+            raise ValueError(f"{where}: text models need max_chars and max_length")
         if self.kind == "sklearn_classifier" and not self.n_features:
-            raise ValueError(f"{self.name} v{self.version}: feature models need n_features")
+            raise ValueError(f"{where}: feature models need n_features")
+        if self.max_batch_size < 1 or self.max_wait_ms < 0:
+            raise ValueError(f"{where}: max_batch_size >= 1 and max_wait_ms >= 0 required")
+
+    @property
+    def runner_options(self) -> dict[str, Any]:
+        """Constructor arguments for this version's runner (``build_runner(kind, **options)``)."""
+        return {"max_length": self.max_length} if self.kind == "transformer_classifier" else {}
 
     @property
     def queue(self) -> str:
@@ -95,6 +108,9 @@ SENTIMENT_V1 = ModelSpec(
     # About 4x a 48-token English text. The token limit (C1.13) bounds compute and is applied by
     # truncation in the worker; this one bounds the Redis message and tokenizer work (C2.2).
     max_chars=1000,
+    max_length=48,  # C1.13: the longest length whose batches still fit the 150 ms budget
+    max_batch_size=4,  # C1.14 (P19: 4 or 8, decided by the load test)
+    max_wait_ms=15.0,  # D5
 )
 
 IRIS_V1 = ModelSpec(
@@ -103,6 +119,10 @@ IRIS_V1 = ModelSpec(
     kind="sklearn_classifier",
     artifact="iris-v1",
     n_features=4,
+    # Batching off (C1.8): waiting to fill a batch costs far more than the 0.12 ms call. P16
+    # proposes trying max_wait_ms = 0 with a larger batch size in the load test.
+    max_batch_size=1,
+    max_wait_ms=0.0,
 )
 
 CATALOG: dict[tuple[str, int], ModelSpec] = {

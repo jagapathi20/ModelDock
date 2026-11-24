@@ -122,6 +122,39 @@ async def test_concurrent_requests_each_get_their_own_reply(worker_thread):
 
 @pytest.mark.redis
 @needs_redis
+async def test_concurrent_requests_are_batched(real_redis, iris_runner):
+    """With batching on, concurrent requests share model calls, and each still gets its answer."""
+    from tests.test_worker import batching_spec
+
+    worker = Worker(
+        batching_spec(max_batch_size=4, max_wait_ms=20),
+        iris_runner,
+        redis.Redis.from_url(TEST_REDIS_URL, socket_timeout=2),
+    )
+    thread = threading.Thread(target=worker.run, daemon=True)
+    thread.start()
+    inputs = [[5.1, 3.5, 1.4, 0.2], [6.7, 3.0, 5.2, 2.3], [5.9, 3.0, 4.2, 1.5]] * 8
+    expected = ["setosa", "virginica", "versicolor"] * 8
+    app = _api(request_timeout_ms=2000)
+    try:
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                assert await _ready(client)
+                responses = await asyncio.gather(
+                    *(client.post("/v1/models/iris/predict", json={"features": f}) for f in inputs)
+                )
+    finally:
+        worker.stop()
+        thread.join(timeout=3)
+    assert [r.json()["output"]["label"] for r in responses] == expected
+    sizes = [int(r.headers["X-Batch-Size"]) for r in responses]
+    assert max(sizes) > 1 and max(sizes) <= 4
+    assert worker.stats.batches < len(inputs)
+
+
+@pytest.mark.redis
+@needs_redis
 async def test_without_a_worker_the_request_times_out(real_redis):
     app = _api(request_timeout_ms=150)
     async with app.router.lifespan_context(app):
@@ -146,7 +179,7 @@ async def test_expired_request_left_in_the_queue_is_dropped(real_redis, iris_run
             ).status_code == 504
 
     worker = Worker(IRIS_V1, iris_runner, redis.Redis.from_url(TEST_REDIS_URL))
-    assert worker.run_once(block_timeout_s=0.5) is True
+    assert worker.run_once(block_timeout_s=0.5) == 1
     assert worker.stats.expired == 1 and worker.stats.processed == 0
     assert real_redis.keys("replies:*") == []
 
@@ -162,7 +195,7 @@ def test_reply_list_expiry_follows_redis_rules(real_redis, iris_runner):
     worker = Worker(IRIS_V1, iris_runner, real_redis)
     from common.protocol import ReplyMessage
 
-    worker._push(key, ReplyMessage(request_id="e" * 32, status="ok", output={}, version=1))
+    worker._push([(key, ReplyMessage(request_id="e" * 32, status="ok", output={}, version=1))])
     assert 0 < real_redis.ttl(key) <= 60
     # Popping the last element deletes the key (so a live listener's list rarely exists).
     real_redis.lpop(key)

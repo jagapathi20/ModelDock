@@ -88,11 +88,15 @@ class ReplyError(BaseModel):
 
 
 class Timings(BaseModel):
+    """Where one request's time went inside the system (D13's latency stages, C3.5)."""
+
     model_config = ConfigDict(frozen=True)
     queue_wait_ms: float  # enqueued_at_ms -> popped by the worker (cross-process: wall clock)
-    inference_ms: float  # runner.predict_batch, measured with perf_counter inside the worker
-    batch_size: int  # always 1 until Stage 3 batches
-    # batch_wait_ms arrives with batching in Stage 3.
+    # popped -> the model call that produced this result started (worker's monotonic clock):
+    # time spent in a forming batch, plus any re-runs after a failed batch.
+    batch_wait_ms: float = 0.0
+    inference_ms: float  # that model call, measured with perf_counter inside the worker
+    batch_size: int  # requests in that model call
 
 
 class ReplyMessage(_Message):

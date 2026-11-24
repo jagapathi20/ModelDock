@@ -18,7 +18,11 @@ This README lists only what is built. The scope of the first release is in
   size limit (413), a 500 ms timeout (504), and a reply listener that recovers from Redis
   outages by itself.
 
-**Next, in order:** dynamic batching, backpressure
+- Dynamic batching in the worker: up to `max_batch_size` requests per model call, a `max_wait`
+  window timed by the worker itself, and failed batches re-run so one bad input fails only its
+  own request.
+
+**Next, in order:** backpressure
 (503), containers and graceful shutdown, Prometheus metrics, open-loop load tests.
 
 **Design:** [`docs/DESIGN.md`](docs/DESIGN.md) holds the initial design and a log of every change
@@ -46,7 +50,8 @@ model) and send `{"text": "a great film"}` to `/v1/models/sentiment/predict`.
 uv sync --extra worker                          # torch (CPU), transformers, scikit-learn
 uv run python -m scripts.fetch_sentiment_model  # -> artifacts/sentiment-v1 (pinned Hub commit)
 uv run python -m scripts.train_iris             # -> artifacts/iris-v1
-uv run python -m scripts.bench_batching --model-dir artifacts/sentiment-v1
+uv run python -m scripts.bench_batching --model-dir artifacts/sentiment-v1 \
+    --threads 4 --max-length 48 --words 46     # current settings (C1.5, C1.13)
 ```
 
 ## Benchmark results

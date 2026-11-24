@@ -16,7 +16,10 @@ Per request it records, from the client's clock and the ``Server-Timing`` header
 
 - ``e2e_ms``: client-side, request sent to response read (perf_counter)
 - ``inference_ms``: inside the worker, around ``predict_batch``
-- ``overhead_ms = e2e_ms - inference_ms``: the number C1.14, C1.16 and C1.17 assumed was 30 ms
+- ``overhead_ms = e2e_ms - inference_ms - batch_ms``: the number C1.14, C1.16 and C1.17 assumed
+  was 30 ms. ``batch_ms`` (time in a forming batch, from Stage 3) is subtracted too: with one
+  request in flight, a batching model's request waits out the whole ``max_wait`` window, which
+  is batcher configuration (D13 measures it as its own stage), not path overhead
 - split of the overhead: ``http_ms = e2e - app`` (client, HTTP, uvicorn, middleware) and
   ``rpc_ms = app - queue_wait - inference`` (validation, JSON, Redis round trips, worker decode,
   listener wake-up)
@@ -73,7 +76,16 @@ def summarize(values: list[float]) -> dict[str, float]:
 def run(client: httpx.Client, model: str, inputs: list[dict], warmup: int) -> dict[str, Any]:
     url = f"/v1/models/{model}/predict"
     samples: dict[str, list[float]] = {
-        k: [] for k in ("e2e_ms", "inference_ms", "overhead_ms", "http_ms", "rpc_ms", "queue_ms")
+        k: []
+        for k in (
+            "e2e_ms",
+            "inference_ms",
+            "overhead_ms",
+            "http_ms",
+            "rpc_ms",
+            "queue_ms",
+            "batch_ms",
+        )
     }
     errors: dict[str, int] = {}
     for i, body in enumerate(inputs):
@@ -88,9 +100,12 @@ def run(client: httpx.Client, model: str, inputs: list[dict], warmup: int) -> di
         t = parse_server_timing(resp.headers["Server-Timing"])
         samples["e2e_ms"].append(e2e)
         samples["inference_ms"].append(t["inference"])
-        samples["overhead_ms"].append(e2e - t["inference"])
+        samples["overhead_ms"].append(e2e - t["inference"] - t.get("batch", 0.0))
         samples["http_ms"].append(e2e - t["app"])
-        samples["rpc_ms"].append(t["app"] - t["queue"] - t["inference"])
+        # batch: time in a forming batch (Stage 3+). At light load with one request in flight it
+        # is the batch window (max_wait) unless the model doesn't batch; it's not overhead.
+        samples["rpc_ms"].append(t["app"] - t["queue"] - t.get("batch", 0.0) - t["inference"])
+        samples["batch_ms"].append(t.get("batch", 0.0))
         samples["queue_ms"].append(t["queue"])
     if not samples["e2e_ms"]:
         raise SystemExit(f"no successful requests (errors by status: {errors})")

@@ -4,6 +4,13 @@ It serves the catalog entry named by ``MODELDOCK_WORKER_MODEL`` / ``MODELDOCK_WO
 (default: sentiment v1), loaded from ``MODELDOCK_ARTIFACTS_DIR``. Command-line flags override them:
 
     uv run python -m worker --model iris
+
+Threads: ``MODELDOCK_WORKER_THREADS`` (default 4, the M1's performance cores, C1.5) caps every
+native pool (C3.2). The iris model's inference takes ~0.15 ms, so run its worker with
+``MODELDOCK_WORKER_THREADS=1``: more threads only add wake-up cost.
+
+Nothing in this module's imports loads numpy or torch; the runner is imported only after the
+thread caps are set (a test checks this).
 """
 
 import argparse
@@ -15,6 +22,7 @@ from common.config import get_settings
 from common.models import get_spec
 from worker.loop import Worker, check_spec_matches
 from worker.runners import build_runner
+from worker.threads import cap_native_threads, log_thread_pools
 
 
 def main() -> None:
@@ -29,15 +37,18 @@ def main() -> None:
     )
     spec = get_spec(args.model, args.version)
 
+    # Before anything imports numpy: BLAS and OpenMP pools read their limits once, at load (C3.2).
+    cap_native_threads(settings.worker_threads)
     if spec.kind == "transformer_classifier":
         # Process-wide, and before the first inference (see configure_cpu_threads).
         from worker.runners.transformer import configure_cpu_threads
 
         configure_cpu_threads(settings.worker_threads)
 
-    runner = build_runner(spec.kind)
+    runner = build_runner(spec.kind, **spec.runner_options)
     runner.load(settings.artifacts_dir / spec.artifact)
     check_spec_matches(spec, runner)
+    log_thread_pools()
 
     # socket_timeout must exceed the BLPOP timeout (1 s), or every idle wait would surface as a
     # timeout error. health_check_interval makes redis-py ping a connection that sat idle, so a

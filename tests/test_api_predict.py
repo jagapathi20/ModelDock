@@ -65,6 +65,8 @@ async def test_round_trip_ok(make_api, fake_server):
     assert resp.headers["X-Model-Version"] == "1"
     assert "queue;dur=0.500" in resp.headers["Server-Timing"]
     assert "inference;dur=1.250" in resp.headers["Server-Timing"]
+    assert "batch;dur=" in resp.headers["Server-Timing"]
+    assert resp.headers["X-Batch-Size"] == "1"
     assert len(app.state.pending) == 0  # cleaned up in finally
 
 

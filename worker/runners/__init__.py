@@ -10,16 +10,20 @@ from worker.runners.base import InvalidInputError, JsonDict, ModelNotLoadedError
 RUNNER_KINDS = ("transformer_classifier", "sklearn_classifier")
 
 
-def build_runner(kind: str) -> ModelRunner:
-    """Create an (unloaded) runner by kind name."""
+def build_runner(kind: str, **options) -> ModelRunner:
+    """Create an (unloaded) runner by kind name; ``options`` go to its constructor.
+
+    The worker passes the catalog's per-version settings, e.g. ``max_length=48`` for a
+    transformer (C1.13).
+    """
     if kind == "transformer_classifier":
         from worker.runners.transformer import TransformerClassifierRunner
 
-        return TransformerClassifierRunner()
+        return TransformerClassifierRunner(**options)
     if kind == "sklearn_classifier":
         from worker.runners.tabular import SklearnClassifierRunner
 
-        return SklearnClassifierRunner()
+        return SklearnClassifierRunner(**options)
     raise ValueError(f"unknown runner kind {kind!r}; expected one of {RUNNER_KINDS}")
 
 

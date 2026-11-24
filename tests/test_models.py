@@ -71,8 +71,34 @@ def test_features_rejected(bad):
         IRIS_V1.validate_input(bad)
 
 
+def test_batching_settings_per_version():
+    # C1.13, C1.14, D5; iris doesn't batch (C1.8).
+    assert (SENTIMENT_V1.max_batch_size, SENTIMENT_V1.max_wait_ms, SENTIMENT_V1.max_length) == (
+        4,
+        15.0,
+        48,
+    )
+    assert (IRIS_V1.max_batch_size, IRIS_V1.max_wait_ms) == (1, 0.0)
+    assert SENTIMENT_V1.runner_options == {"max_length": 48}
+    assert IRIS_V1.runner_options == {}
+
+
+def test_spec_rejects_bad_batching_settings():
+    with pytest.raises(ValueError):
+        ModelSpec(
+            name="s",
+            version=1,
+            kind="sklearn_classifier",
+            artifact="s",
+            n_features=4,
+            max_batch_size=0,
+        )
+
+
 def test_spec_requires_its_kinds_limit():
     with pytest.raises(ValueError, match="max_chars"):
         ModelSpec(name="t", version=1, kind="transformer_classifier", artifact="t")
+    with pytest.raises(ValueError, match="max_length"):
+        ModelSpec(name="t", version=1, kind="transformer_classifier", artifact="t", max_chars=10)
     with pytest.raises(ValueError, match="n_features"):
         ModelSpec(name="s", version=1, kind="sklearn_classifier", artifact="s")

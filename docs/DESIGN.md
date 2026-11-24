@@ -116,7 +116,7 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - `max_wait` mostly matters at light load. `max_batch_size` mostly matters at heavy load, where the queue refills while a batch runs.
 - Both are configurable **per model version**. Starting values for the main model: `max_batch_size = 16`, `max_wait = 15 ms`. The sklearn model uses `max_batch_size = 1`.
 
-> **Changed later:** C1.4 (`max_batch_size` 16 → 8), C1.11 (what `max_wait` bounds), C1.14 (`max_batch_size` 8 → 4). See [Part 2](#part-2-design-change-log).
+> **Changed later:** C1.4 (`max_batch_size` 16 → 8), C1.11 (what `max_wait` bounds), C1.14 (`max_batch_size` 8 → 4), C3.1 (the window starts at the first request's arrival, clamped; the worker keeps time by polling). See [Part 2](#part-2-design-change-log).
 
 ### D6: Backpressure and overload
 - Before enqueuing, the API checks queue depth (`LLEN`). Over the threshold, it **immediately returns 503 Service Unavailable with `Retry-After`**, rather than letting requests wait.
@@ -137,7 +137,7 @@ A production-style **ML model inference server**: clients send inputs over HTTP 
 - Why not many single-batch processes by default: each holds a copy of the model in RAM, and traffic splits across them, giving smaller batches.
 - Processes × threads-per-process is configurable. The benchmark stage compares **1×8, 2×4, and 4×2** (adjust to the machine's core count).
 
-> **Changed later:** C1.5, C1.6, C1.11 (collector thread removed). See [Part 2](#part-2-design-change-log).
+> **Changed later:** C1.5, C1.6, C1.11 (collector thread removed), C3.2 (every native thread pool capped). See [Part 2](#part-2-design-change-log).
 
 ### D8: Model registry and storage
 - **Weights go in object storage** (MinIO locally, S3-compatible such as Cloudflare R2 in deployment) under **immutable keys** that include version and content hash, e.g. `models/sentiment/v3-<sha256prefix>.pt`. A version's file is never overwritten.
@@ -317,7 +317,8 @@ Use migrations (Alembic).
 ```
 
 > **Changed later:** C2.1 (`error` is an object with a code), C2.5 (timestamps are fractional
-> milliseconds; `reply_to` restricted to `replies:<32 hex>`). See [Part 2](#part-2-design-change-log).
+> milliseconds; `reply_to` restricted to `replies:<32 hex>`), C3.5 (what each timing measures).
+> See [Part 2](#part-2-design-change-log).
 
 ---
 
@@ -437,6 +438,9 @@ below traces to one of these result files, committed in `bench/results/`:
 | S | `bench_batching.py` | sklearn (iris) | n/a | 4 features | 100 | `stage1-sklearn_classifier-20261106T150255Z.json` |
 | B | `bench_batching_1.py` | DistilBERT | 4 | ~26 tokens | 300 | `stage1-transformer_classifier-20261106T151131Z.json` |
 | C | `bench_batching_1.py` | DistilBERT | 8 | ~26 tokens | 300 | `stage1-transformer_classifier-20261106T151327Z.json` |
+
+> **Scripts merged in C3.4:** `bench_batching.py` now holds both copies. The scripts named in these
+> tables, and Stage 1's budget formulas, are in the Stage 1.5 commit (see C3.4 to find it).
 
 ### C1.1: Measured batching gain is 4.2×, not ~10× (D1)
 
@@ -629,7 +633,8 @@ Ignore it; the budgets below are computed by hand from the measured T.
   - Less code: one loop instead of two threads, a handoff queue and a rule.
 - **Trade-off:** collecting no longer overlaps computing. Under load the requests are already in
   Redis, so collecting costs one round trip. Stage 2 measures it to confirm it is small next to T.
-- **Status:** decided 2026-11-10.
+- **Status:** decided 2026-11-10. **Implemented in Stage 3** (`worker/loop.py`), with the window
+  and timing details of C3.1.
 - **Evidence:** reasoning from C1.2 (risk R1 of the audit), not yet measured end to end. The T
   values the formula is applied to come from
   - `bench/results/stage1-transformer_classifier-20261106T151131Z.json` (run B)
@@ -683,7 +688,8 @@ Ignore it; the budgets below are computed by hand from the measured T.
   - The latency target (C1.12) is stated for inputs **up to `max_length` tokens**.
   - **`max_length = 48`**: the longest measured length where a small batch still fits the budget
     (64 tokens fails even at the median, see C1.14).
-  - `max_length` is **part of the model version and immutable**, like the weights. Changing it
+  - `max_length` is **part of the model version and immutable**, like the weights (in the catalog,
+    `common/models.py`, since Stage 3). Changing it
     changes outputs for the same input (a long text truncated at 48 vs 128 can get a different
     label), which would silently make D10's cached answers stale.
   - Longer inputs are truncated, keeping the start. The API also caps input size in characters,
@@ -718,7 +724,7 @@ Ignore it; the budgets below are computed by hand from the measured T.
   | Saturated worst case, 2T + 30 ms | **108 ms** | 159 ms |
   | Throughput, one worker | 137 items/s | 167 items/s |
 
-  - **`max_batch_size = 4`.** `max_wait` stays 15 ms.
+  - **`max_batch_size = 4`.** `max_wait` stays 15 ms. (Both in the catalog since Stage 3.)
   - **`max_queue_depth` = 8 per worker:** m = floor((150 − 30) / 38.9) − 1 = 2, so 2 × 4 = 8.
     Worst case at the limit (7 requests ahead): 3T + 30 = 147 ms.
   - Sklearn under the C1.11 formula: m ≈ 427, still hundreds per worker on model-only timing.
@@ -1209,6 +1215,8 @@ building the endpoint. Details in [`stages/02-queue-round-trip.md`](stages/02-qu
     `enqueued_at_ms + max_wait`) and for `queue_wait_ms`. Skew shifts both: a worker clock 10 ms
     ahead leaves a 15 ms `max_wait` only 5 ms. Stage 3 should decide whether to measure `max_wait`
     from the worker's own (monotonic) pop time instead, which skew can't affect.
+    **Resolved by C3.1:** from `enqueued_at_ms`, clamped so skew can only shorten the window to
+    zero or lengthen it to `max_wait`.
 - **Evidence:** reasoning; documented clock behaviour. No benchmark run.
 
 ### C2.4: Redis URLs are secrets (C0.2; resolves P18)
@@ -1322,6 +1330,133 @@ Not specified before Stage 2; decided while building it.
   - `bench/results/stage2-overhead-sentiment-20261122T093415Z.json`: sentiment figures
   - `bench/results/stage1-transformer_classifier-20261110T105742Z.json` (run I): T at batch 4 and 8, and the 137 / 167 items/s
 
+## Stage 3: batching
+
+Sources: the Stage 3 proposals (Q1 to Q4), accepted 2026-11-24, and a Redis behaviour found while
+building. Details in [`stages/03-batching.md`](stages/03-batching.md).
+
+### C3.1: The batch window starts at the first request's arrival, clamped; the worker keeps time itself (D5, C1.11, C2.3)
+
+- **Before:** C1.11: "wait for more only until `max_wait` has passed since the first request's
+  `enqueued_at_ms`". C2.3 asked whether to measure from the worker's pop time instead, since
+  `enqueued_at_ms` is the API's clock. The Stage 3 plan was to wait with `BLPOP` and the remaining
+  time as its timeout.
+- **What broke:**
+  - **Skew was unbounded.** With the window computed from `enqueued_at_ms` alone, a worker clock
+    behind the API's would keep a batch open for as long as the clocks disagree.
+  - **Redis's blocking timeouts are coarse.** Redis checks blocked clients' timeouts on its
+    internal timer, `hz` (10 per second by default), not exactly when they fall due. A `BLPOP`
+    returns at once when an element arrives, but **its timeout can fire up to about 100 ms late**.
+    Seen while building this stage (Linux, Redis 7.0.15, not a recorded benchmark): 5, 15 and
+    50 ms timeouts all returned after a median of about 100 ms; with `hz` raised to 100, a 15 ms
+    timeout took about 21 ms. The timeout is exactly the light-load case, where `max_wait` matters,
+    so a 15 ms window would have become about 100 ms.
+- **After:**
+  - **The window runs from the first request's arrival, with the queue time clamped:**
+    `remaining = max_wait − clamp(now_ms() − enqueued_at_ms, 0, max_wait)`, computed when that
+    request is popped and then counted down on the worker's monotonic clock. Without skew this is
+    exactly D5's rule (no request waits more than `max_wait` for its batch to start, and one that
+    already queued longer than that runs at once). With skew, the window can only shrink to zero
+    (worker clock ahead) or grow to the full `max_wait` (worker clock behind), never more.
+  - **The worker keeps the time.** While the batch is open, it sleeps in 1 ms steps
+    (`POLL_INTERVAL_S`) and takes newcomers with a non-blocking `LPOP key count`. A batch closes
+    within about 1 ms of filling, or when the window ends. `BLPOP` is used only for the first
+    request of a batch, where its 1 s timeout just paces the idle heartbeat.
+  - The window starts from the batch's first *valid* request: a malformed, expired or invalid
+    first message doesn't anchor it.
+- **Cost:** at light load a 15 ms window costs up to 15 `LPOP` round trips per batch (each well
+  under a millisecond locally). Under load a batch fills on its first `LPOP` and never polls.
+- **Rejected:**
+  - `BLPOP` with the remaining time: the timer granularity above.
+  - Raising Redis's `hz`: still several milliseconds late, costs Redis CPU on every timer tick,
+    and a managed Redis may not allow changing it.
+  - A client-side socket timeout to cut `BLPOP` short: redis-py treats it as a broken connection
+    and reconnects.
+  - Measuring the window from the worker's pop time (C2.3's alternative): skew-proof, but a request
+    that already queued 40 ms would wait up to 15 ms more for company, adding latency exactly when
+    the system is behind.
+- **Evidence:** documented Redis behaviour (`hz` drives the handling of client timeouts); the
+  workspace observation above; `tests/test_worker.py` (window, clamp under simulated skew, time
+  and size triggers, a batch closing soon after it fills).
+
+### C3.2: Every native thread pool in a worker is capped (D7, C1.5; resolves P15)
+
+- **Before:** `torch.set_num_threads(N)` only. numpy (and so scikit-learn) uses a BLAS library with
+  a pool of its own (Accelerate on macOS, OpenBLAS on Linux, sometimes MKL), and OpenMP code has
+  another. Those read their limits once, from environment variables, when first loaded.
+- **After:**
+  - Before any runner (and so numpy or torch) is imported, the worker sets `OMP_NUM_THREADS`,
+    `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` and `VECLIB_MAXIMUM_THREADS` to `worker_threads`,
+    with `setdefault`, so a value set explicitly in the environment still wins.
+  - Transformer workers also call `torch.set_num_threads(worker_threads)` and
+    `torch.set_num_interop_threads(1)`: the inter-op pool runs independent operators in parallel,
+    and one forward pass of a sequential model gains nothing from it.
+  - At startup the worker logs the pools actually loaded, from `threadpoolctl`. It doesn't see
+    every library (Apple Accelerate isn't reported), so this is a check, not a guarantee.
+  - The iris worker runs with `MODELDOCK_WORKER_THREADS=1`: its inference takes a fraction of a
+    millisecond, and more threads only add wake-up cost. Thread counts are deployment settings,
+    not catalog entries, because C1.5 ties them to the machine's cores.
+- **Evidence:** documented BLAS/OpenMP behaviour; `tests/test_threads.py` (the worker's entry
+  point imports no numpy or torch; the pools numpy loads respect the cap).
+
+### C3.3: A failed batch fails only the requests that fail on their own (amends C2.1)
+
+- **Before (C2.1):** validate each input before forming the batch; if the batch still fails,
+  re-run each request alone.
+- **After:**
+  - **The worker validates each popped request against the same catalog schema as the API.** It
+    costs microseconds per input and catches anything that reached the queue without going through
+    the API. A request that fails gets its `invalid_input` reply without reaching the model.
+  - **`InvalidInputError` naming an input** (its `index`): that request gets `invalid_input`; the
+    rest run again **as one batch**, so one bad input costs one extra batch rather than a solo run
+    per request.
+  - **Any other failure** (or an `InvalidInputError` without a usable index, or a runner returning
+    the wrong number of outputs): each request runs alone, with a deadline check before each run.
+    A request that fails alone too gets `inference_failed`; so if every request fails alone, all
+    get 500.
+  - Each reply's `batch_size` and `inference_ms` describe the model call that produced *its*
+    result.
+- **Evidence:** reasoning; `tests/test_worker.py` (each path).
+
+### C3.4: One batching benchmark, with C1.11's budget and the recommended queue limit (C1.11, C1.17)
+
+- **Before:** two near-identical scripts, `bench_batching.py` (runs A, S) and `bench_batching_1.py`
+  (runs B to K, adding the P/E core report), both printing Stage 1's outdated budget.
+- **After:**
+  - **One script,** `scripts/bench_batching.py`, with the P/E core report. `bench_batching_1.py` is
+    deleted. To reproduce a Stage 1 run exactly, check out the Stage 1.5 commit, where both copies
+    and the old budget still exist: `git log --diff-filter=D --oneline --
+    scripts/bench_batching_1.py` names the commit that deleted the copy; check out its parent.
+  - **The budget is C1.11's** (light load, saturated with an empty queue, at the queue limit) and
+    the script prints the **recommended `max_queue_depth`** (C1.17), or says that no limit meets
+    the target. New flags: `--overhead-ms` (default 1.77, C2.6's measurement, cited in the code),
+    `--workers`.
+  - **Defaults that keep Stage 1's commands meaning what they meant:** `--max-length` (new)
+    defaults to 128 and `--threads` to all logical cores, as in Stage 1. Both are recorded in each
+    result's `args`. New runs pass `--max-length 48 --threads 4`. Budget defaults follow the current
+    design (`--max-batch-size 4`); they don't affect the measurements.
+  - Transformer runs also cap the native thread pools (C3.2).
+- **Evidence:** `tests/test_bench.py` (the formulas with hand-worked values, scaling with workers,
+  the no-limit case, and C2.6's numbers reproduced: 8 per worker, 118.47 ms at the limit).
+
+### C3.5: Batching settings live in the catalog; what each timing measures (D5, D13, section 6)
+
+- **After:**
+  - Per version in `common/models.py`: `max_batch_size`, `max_wait_ms`, and for text models
+    `max_length`. sentiment v1: 4, 15 ms, 48 tokens. iris v1: 1, 0 ms (batching off, C1.8).
+  - **Reply timings, per request:** `queue_wait_ms` = the worker's pop − the API's
+    `enqueued_at_ms` (wall clock, C2.3); **`batch_wait_ms`** = pop → start of the model call that
+    produced this request's result (worker's monotonic clock; includes re-runs after a failed
+    batch); `inference_ms` = that call; `batch_size` = its size. These are D13's latency stages:
+    queue wait for overload, batch wait for batcher configuration, inference for a slow version.
+  - **HTTP:** `Server-Timing` gains `batch;dur=…`; a new `X-Batch-Size` header.
+  - **The overhead benchmark subtracts batch wait too:** with one request in flight, a batching
+    model's request waits out the whole window, which is configuration (its own D13 stage), not
+    path overhead. Stage 2's results had no batch wait, so C2.6 is unaffected.
+- **Evidence:** `tests/test_worker.py`, `tests/test_api_predict.py`,
+  `tests/test_roundtrip_redis.py::test_concurrent_requests_are_batched` (real Redis, real iris
+  model, batching on: concurrent requests share model calls and each gets its own answer).
+
 ---
 
 # Part 3: Current values at a glance
@@ -1331,9 +1466,11 @@ Not specified before Stage 2; decided while building it.
 | Main model `max_batch_size` | 16 | **4** | C1.4, C1.14 |
 | Main model `max_wait` | 15 ms | 15 ms | |
 | Main model input length | unspecified | **48 tokens, per version, immutable** | C1.9, C1.13 |
-| Worker loop | collector thread + compute thread | **one loop, pulls a batch when compute is free** | C1.6, C1.11 |
+| Worker loop | collector thread + compute thread | **one loop, pulls a batch when compute is free; built in Stage 3** | C1.6, C1.11 |
+| Batch window | `max_wait` since the first request | **from the first request's `enqueued_at_ms`, queue time clamped to [0, max_wait]; timed by the worker, polling every 1 ms (not a `BLPOP` timeout)** | C3.1 |
+| Failed batch | whole batch fails | **only requests that fail alone get the error; a named bad input is removed and the rest re-run as a batch** | C2.1, C3.3 |
 | Saturated worst case (empty queue) | not modelled | **2T** | C1.2, C1.11 |
-| Inference threads (M1) | ≤ cores (8) | **4 (performance cores)** | C1.5 |
+| Inference threads (M1) | ≤ cores (8) | **4 (performance cores); every native pool capped, interop 1; iris worker 1** | C1.5, C3.2 |
 | Queue limit | 16 × workers | **`max_queue_depth`: explicit per-version total, set from the benchmark's recommendation (8 per worker for the transformer; unchanged with measured overhead, checked by the load test)** | C1.7, C1.11, C1.14, C1.17 |
 | p99 target | < 150 ms at target load | < 150 ms for inputs ≤ 48 tokens: **at ≤ 70% load, and for accepted requests under overload** | C1.3, C1.12 |
 | Contrast model `max_batch_size` | 1 | 1 (rationale corrected) | C1.8 |
@@ -1351,6 +1488,7 @@ Not specified before Stage 2; decided while building it.
 | Redis URL | plain string | **`SecretStr`** (and the future `cache_redis_url`) | C2.4 |
 | Wire timestamps | integer ms | **fractional ms, wall clock (assumes synchronised clocks across hosts)** | C2.3, C2.5 |
 | Serving overhead | 30 ms assumed | **1.77 ms p99 (sentiment), 1.10 ms (iris), at light load: a lower bound** | C2.6 |
+| Batching benchmark | two scripts, Stage 1 budget | **one script, C1.11 budget, recommended `max_queue_depth`** | C3.4 |
 | Benchmark result files | git-ignored | **committed in `bench/results/`; a test checks every cited file exists; new files record script and git commit** | C1.23 |
 
 ---
@@ -1385,8 +1523,7 @@ The proposals below come from the design audit of 2026-11-10. Risks R1 and R2 ar
 - **P12: listener failure.** Decided: see C1.19.
 - **P13: metrics.** Decided: see C1.20.
 - **P14: containers and worker health.** Decided: see C1.21.
-- **P15: thread caps for numpy/BLAS (D7).** Set the thread environment variables before numpy is
-  imported, so total threads stay within the performance cores.
+- **P15: thread caps for numpy/BLAS.** Decided: see C3.2.
 - **P16: sklearn batching (C1.8).** C1.8's reason argues for `max_wait_ms = 0`, not for
   `max_batch_size = 1`. Proposal: try `max_wait_ms = 0` with a larger batch size in the load test.
 - **P17: recorded for deferred stages.** Decided: see C1.22.

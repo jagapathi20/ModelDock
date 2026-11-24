@@ -186,6 +186,13 @@ def test_build_runner_returns_transformer_runner():
     assert isinstance(build_runner("transformer_classifier"), TransformerClassifierRunner)
 
 
+def test_build_runner_passes_the_catalogs_options():
+    from common.models import SENTIMENT_V1
+
+    runner = build_runner(SENTIMENT_V1.kind, **SENTIMENT_V1.runner_options)
+    assert runner.max_length == 48  # C1.13: the worker truncates at 48 tokens
+
+
 def test_build_runner_rejects_unknown_kind():
     with pytest.raises(ValueError, match="unknown runner kind"):
         build_runner("onnx")

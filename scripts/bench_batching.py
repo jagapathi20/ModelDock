@@ -1,28 +1,40 @@
-"""Measure how inference time scales with batch size.
+"""Measure how inference time scales with batch size (model only: no Redis, no HTTP).
 
-    uv run python -m scripts.bench_batching --model-dir artifacts/sentiment-v1
+    uv run python -m scripts.bench_batching --model-dir artifacts/sentiment-v1 --threads 4 \
+        --max-length 48 --words 46
     uv run python -m scripts.bench_batching --kind sklearn_classifier --model-dir artifacts/iris-v1
 
-For each batch size, the script runs a few warm-up batches (not recorded),
-then ``--iters`` timed batches, and reports per-batch time (p50/p90/p99),
-per-item time, throughput, and the per-item speedup over batch size 1.
-For the transformer it also splits time into tokenize / forward / postprocess.
+For each batch size, the script runs a few warm-up batches (not recorded), then ``--iters``
+timed batches, and reports per-batch time (p50/p90/p99), per-item time, throughput, and the
+per-item speedup over batch size 1. For the transformer it also splits time into tokenize /
+forward / postprocess. On macOS it records the chip and its performance/efficiency core split,
+so a thread-count experiment on Apple Silicon can be interpreted.
 
-It finishes with a latency budget check: plugging the measured batch times
-into the D1/D5 worst-case formulas for the configured ``max_batch_size`` and
-``max_wait``. Results (with hardware info) are written to a JSON file so the
-numbers that end up in the README can be traced to a real run.
+It finishes with the **latency budget** (C1.11) for ``--max-batch-size`` and ``--max-wait-ms``,
+using T = the measured p99 of a full batch and ``--overhead-ms`` for everything outside
+inference, and prints the **recommended ``max_queue_depth``** (C1.17), which is set by hand.
 
-Only this process runs: no Redis, no HTTP. These are model-only numbers, a
-lower bound on what the server can do.
+**History (C3.4).** Stage 1 had two copies of this script: ``bench_batching.py`` (run A, S) and
+``bench_batching_1.py`` (runs B to K), identical except that the copy added the P/E core report.
+Stage 3 merged them into this file. To reproduce a Stage 1 run exactly, check out the Stage 1.5
+commit, where both copies and the Stage 1 budget formulas still exist:
+``git log --diff-filter=D --oneline -- scripts/bench_batching_1.py`` names the commit that
+removed the copy; its parent is the one to check out.
+
+**Defaults that preserve Stage 1 commands.** ``--max-length`` defaults to 128 and ``--threads``
+to all logical cores, as in Stage 1, so the commands recorded for runs A to K still mean what
+they meant. Both are written to each result file's ``args``. New runs pass ``--max-length 48``
+(C1.13) and ``--threads 4`` (C1.5).
 """
 
 import argparse
 import json
+import math
 import os
 import platform
 import random
 import statistics
+import subprocess
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
@@ -32,6 +44,7 @@ from typing import Any
 
 from scripts.provenance import provenance
 from worker.runners import RUNNER_KINDS, ModelRunner, build_runner
+from worker.threads import cap_native_threads
 
 # Neutral words plus a few sentiment-bearing ones. Random sentences are
 # meaningless, but the model's cost depends only on token count, not meaning.
@@ -153,43 +166,60 @@ def measure(
 
 
 def latency_budget(
-    results: Sequence[BatchResult], max_batch_size: int, max_wait_ms: float, target_ms: float
+    results: Sequence[BatchResult],
+    max_batch_size: int,
+    max_wait_ms: float,
+    target_ms: float,
+    overhead_ms: float,
+    workers: int = 1,
 ) -> dict[str, Any] | None:
-    """Worst-case request latency (model side only) under the D5 batching rule.
+    """Worst-case latency of an accepted request, and the queue limit that keeps it on target.
 
-    With T = p99 time of a full batch (max_batch_size):
+    The worker runs one loop and takes a batch only when compute is free (C1.11). With
+    T = p99 time of a full batch (``max_batch_size`` = B) and d requests ahead in Redis:
 
-    - light load:  the request starts a batch, waits up to max_wait for it to
-                   fill, then the batch runs:              max_wait + T
-    - saturated:   a full batch is already running (compute thread busy); the
-                   request's batch fills instantly, waits for it, then runs: 2T
-    - at the backpressure threshold (D6's original limit of one full batch
-                   queued per worker) the request also waits for that batch: 3T
+    - light load:          the request starts a batch, which waits up to max_wait to fill:
+                           max_wait + T + overhead
+    - saturated, empty queue: a full batch is running; this request's batch runs next:
+                           2T + overhead
+    - d requests ahead:    T x (1 + ceil((d + 1) / B)) + overhead
 
-    OUTDATED: this is the Stage 1 model, kept unchanged so the "latency_budget"
-    block in existing result files can still be reproduced. It was corrected by
-    C1.2 and then C1.11 (one worker loop, worst case T x (1 + ceil((d + 1) / B))),
-    and the fixed queue limit was replaced by an explicit per-version
-    max_queue_depth (C1.17). Stage 3 replaces this function. Until then, ignore
-    its output and use the budgets in docs/DESIGN.md.
+    The queue limit is the largest that keeps the last accepted request within the target:
 
-    Excludes Redis round trips, JSON, HTTP and the event loop; Stage 2 measures
-    that overhead, and the Stage 7 load tests measure end-to-end latency.
+        m = floor((target - overhead) / T) - 1          # batches from the queue that fit
+        max_queue_depth = m x B x workers                # 503 when LLEN >= this (C1.17)
+
+    At the limit an accepted request has at most max_queue_depth - 1 requests ahead. With
+    m <= 0 even an empty queue misses the target, and no limit is recommended.
+
+    ``overhead_ms`` is everything outside inference (HTTP, Redis, JSON). C2.6 measured it at light
+    load, which makes it a lower bound: the recommendation is optimistic until a load test
+    checks it (P10).
     """
     full = next((r for r in results if r.batch_size == max_batch_size), None)
     if full is None:
         return None
     t = full.batch_ms_p99
+    b = max_batch_size
+    m = math.floor((target_ms - overhead_ms) / t) - 1
+    per_worker = max(m, 0) * b
+    depth = per_worker * workers
     cases = {
-        "light_load": max_wait_ms + t,
-        "saturated": 2 * t,
-        "at_backpressure_threshold": 3 * t,
+        "light_load": max_wait_ms + t + overhead_ms,
+        "saturated_empty_queue": 2 * t + overhead_ms,
     }
+    if per_worker > 0:
+        ahead = per_worker - 1  # per worker: each worker drains its share of the queue
+        cases["at_queue_limit"] = t * (1 + math.ceil((ahead + 1) / b)) + overhead_ms
     return {
-        "max_batch_size": max_batch_size,
+        "max_batch_size": b,
         "max_wait_ms": max_wait_ms,
         "full_batch_ms_p99": t,
+        "overhead_ms": overhead_ms,
         "target_p99_ms": target_ms,
+        "workers": workers,
+        "batches_from_queue_m": m,
+        "recommended_max_queue_depth": depth if depth > 0 else None,
         "worst_case_ms": cases,
         "within_target": {k: v < target_ms for k, v in cases.items()},
     }
@@ -203,6 +233,14 @@ def machine_info(threads: int | None) -> dict[str, Any]:
         "cpu_model": _cpu_model(),
         "inference_threads": threads,
     }
+    # Apple Silicon mixes performance (P) and efficiency (E) cores. Thread
+    # counts above the P-core count put work on slower E-cores, which shows
+    # up as tail latency, so record the split.
+    p_cores, e_cores = _sysctl("hw.perflevel0.physicalcpu"), _sysctl("hw.perflevel1.physicalcpu")
+    if p_cores:
+        info["performance_cores"] = int(p_cores)
+    if e_cores:
+        info["efficiency_cores"] = int(e_cores)
     try:
         import torch
         import transformers
@@ -215,6 +253,17 @@ def machine_info(threads: int | None) -> dict[str, Any]:
     return info
 
 
+def _sysctl(name: str) -> str | None:
+    """Read a macOS sysctl value; None on other platforms or if missing."""
+    if platform.system() != "Darwin":
+        return None
+    try:
+        out = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None if out.returncode == 0 else None
+
+
 def _cpu_model() -> str:
     try:
         for line in Path("/proc/cpuinfo").read_text().splitlines():
@@ -222,7 +271,8 @@ def _cpu_model() -> str:
                 return line.split(":", 1)[1].strip()
     except OSError:
         pass
-    return platform.processor() or "unknown"
+    # macOS: e.g. "Apple M2". platform.processor() only says "arm".
+    return _sysctl("machdep.cpu.brand_string") or platform.processor() or "unknown"
 
 
 def render(results: Sequence[BatchResult], budget: dict[str, Any] | None) -> str:
@@ -253,14 +303,25 @@ def render(results: Sequence[BatchResult], budget: dict[str, Any] | None) -> str
     if budget:
         lines += [
             "",
-            f"Latency budget (model only), max_batch_size={budget['max_batch_size']}, "
-            f"max_wait={budget['max_wait_ms']:g} ms, "
-            f"full batch p99={budget['full_batch_ms_p99']:.1f} ms, "
+            f"Latency budget (C1.11): max_batch_size={budget['max_batch_size']}, "
+            f"max_wait={budget['max_wait_ms']:g} ms, T (full batch p99)="
+            f"{budget['full_batch_ms_p99']:.1f} ms, overhead={budget['overhead_ms']:g} ms, "
             f"target p99 < {budget['target_p99_ms']:g} ms",
         ]
         for case, ms in budget["worst_case_ms"].items():
             ok = "ok" if budget["within_target"][case] else "OVER"
             lines.append(f"  {case:<27} {ms:8.1f} ms   {ok}")
+        depth = budget["recommended_max_queue_depth"]
+        if depth:
+            lines.append(
+                f"  recommended max_queue_depth: {depth} "
+                f"(m={budget['batches_from_queue_m']}, workers={budget['workers']})"
+            )
+        else:
+            lines.append("  no queue limit meets the target: even an empty queue misses it")
+        lines.append(
+            "  (overhead measured at light load is a lower bound, so this is optimistic; C2.6)"
+        )
     return "\n".join(lines)
 
 
@@ -276,17 +337,35 @@ def main() -> None:
         help="PyTorch intra-op threads (default: all logical cores)",
     )
     p.add_argument("--words", type=int, default=24, help="words per input text")
+    p.add_argument(
+        "--max-length",
+        type=int,
+        default=128,
+        help="transformer: truncate inputs to this many tokens. Default 128 as in Stage 1; "
+        "the catalog's sentiment v1 uses 48 (C1.13)",
+    )
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--iters", type=int, default=100)
-    p.add_argument("--max-batch-size", type=int, default=16, help="for the budget check")
-    p.add_argument("--max-wait-ms", type=float, default=15.0, help="for the budget check")
-    p.add_argument("--target-ms", type=float, default=150.0, help="p99 target (D1)")
+    p.add_argument("--max-batch-size", type=int, default=4, help="for the budget (C1.14)")
+    p.add_argument("--max-wait-ms", type=float, default=15.0, help="for the budget (D5)")
+    p.add_argument("--target-ms", type=float, default=150.0, help="p99 target (C1.12)")
+    p.add_argument(
+        "--overhead-ms",
+        type=float,
+        # Sentiment p99 overhead at light load, C2.6:
+        # bench/results/stage2-overhead-sentiment-20261122T093415Z.json
+        default=1.77,
+        help="everything outside inference, for the budget (default: C2.6's measurement)",
+    )
+    p.add_argument("--workers", type=int, default=1, help="workers for this version (C1.17)")
     p.add_argument("--out", type=Path, default=None, help="JSON output path")
     args = p.parse_args()
 
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
     threads = None
     if args.kind == "transformer_classifier":
+        # Before numpy is first imported: BLAS pools read their limit once, at import (C3.2).
+        cap_native_threads(args.threads)
         from worker.runners.transformer import configure_cpu_threads
 
         threads = args.threads
@@ -299,7 +378,8 @@ def main() -> None:
         def make_inputs(n: int, seed: int) -> list[dict[str, Any]]:
             return make_iris_features(n, seed)
 
-    runner = build_runner(args.kind)
+    options = {"max_length": args.max_length} if args.kind == "transformer_classifier" else {}
+    runner = build_runner(args.kind, **options)
     t0 = time.perf_counter()
     runner.load(args.model_dir)
     load_s = time.perf_counter() - t0
@@ -307,13 +387,23 @@ def main() -> None:
     info = machine_info(threads)
     prov = provenance("bench_batching.py")
     print(f"{args.kind} from {args.model_dir} (loaded in {load_s:.2f} s)")
-    print(f"{info['cpu_model']}, {info['cpu_count_logical']} logical cores, threads={threads}")
+    cores = f"{info['cpu_count_logical']} logical cores"
+    if "performance_cores" in info:
+        cores += f" ({info['performance_cores']}P + {info.get('efficiency_cores', 0)}E)"
+    print(f"{info['cpu_model']}, {cores}, threads={threads}")
     if args.kind == "transformer_classifier":
         print(f"{args.words} words per text")
     print()
 
     results = measure(runner, make_inputs, batch_sizes, args.warmup, args.iters)
-    budget = latency_budget(results, args.max_batch_size, args.max_wait_ms, args.target_ms)
+    budget = latency_budget(
+        results,
+        args.max_batch_size,
+        args.max_wait_ms,
+        args.target_ms,
+        overhead_ms=args.overhead_ms,
+        workers=args.workers,
+    )
     print(render(results, budget))
 
     out = args.out or Path("bench/results") / (
